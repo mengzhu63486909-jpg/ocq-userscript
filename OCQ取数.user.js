@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.5.6
+// @version      0.5.7
 // @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -294,6 +294,15 @@
     return null;
   }
   function clickNextPage(cur) {
+    // 先找分页组件自带的「下一页」按钮（Element 的 .btn-next 只有图标、没有文字）
+    for (const sel of ['.el-pagination .btn-next', '.layui-laypage-next', '.ant-pagination-next', '.pagination .next a', '.pagination li.next', '.vxe-pager--next-btn']) {
+      const b = [...document.querySelectorAll(sel)].find(visible);
+      if (b) { if (isDisabled(b) || /disabled/.test(b.className || '')) return false; b.click(); return true; }
+    }
+    if (cur) {
+      const li = [...document.querySelectorAll('.el-pager li, .ant-pagination-item, .layui-laypage a, .pagination li')].find(x => visible(x) && (x.innerText || '').trim() === String(cur + 1));
+      if (li) { (li.querySelector('a') || li).click(); return true; }
+    }
     const next = findByExactText(['下一页', '下页', '›', '»'], true);
     if (next) { next.click(); return true; }
     if (cur) {
@@ -329,8 +338,9 @@
     const headers = first.parsed.headers.slice();
     const rows = [], seen = new Set();
     let pages = 0, stagnant = 0, cur = currentPageNum() || 1;
-    const dataCount = () => rows.filter(r => { const n = (r[nameIdx] || '').trim(); return n && !/合计|总计|小计|汇总/.test(n); }).length;
-    while (pages < 100) {
+    // 计数：所有非合计行（线索表里很多行没有负责人，旧版只数有负责人的行 → 显示「只抓到 500/2286」）
+    const dataCount = () => rows.filter(r => r.some(v => String(v || '').trim()) && !r.slice(0, 8).some(v => /^(合计|总计|小计|汇总)$/.test(norm(v)))).length;
+    while (pages < 400) {
       await waitSettle(8000);
       const t = findBestTable();
       if (!t) break;
@@ -556,7 +566,7 @@
   }
 
   // ---------------- 原始明细（给自定义报表用） ----------------
-  const RAW_MAX_ROWS = 5000;
+  const RAW_MAX_ROWS = 20000;
   const getRaw = () => gmGet('ocq_raw', {});
   const setRaw = r => gmSet('ocq_raw', r);
   function cleanRaw(headers, rows, nameIdx) {
@@ -585,9 +595,16 @@
   function storeRaw(pk, name, res, nameIdx, range) {
     const c = cleanRaw(res.headers, res.rows, nameIdx);
     const raw = getRaw();
-    raw[pk] = { pageKey: pk, name: name || pk, nameHeader: nameIdx >= 0 ? res.headers[nameIdx] : '', headers: c.headers, rows: c.rows, time: Date.now(), range: range || '' };
-    const keys = Object.keys(raw).sort((a, b) => raw[a].time - raw[b].time);
-    while (keys.length > 1 && JSON.stringify(raw).length > 4e6) delete raw[keys.shift()];
+    const nh = nameIdx >= 0 ? res.headers[nameIdx] : '';
+    let hs = c.headers, rs = c.rows, slim = false;
+    // 大表：只保留报表会用到的列（人员、渠道、状态/有效、日期时间、金额、房子、房屋、小组）
+    if (JSON.stringify(rs).length > 1.5e6) {
+      const keep = hs.map((h, i) => (h === nh || /负责人|顾问|渠道|来源|状态|有效|无效|跑单|判定|结果|日期|时间|金额|收款|未收|房子|房屋|小组|部门/.test(h) ? i : -1)).filter(i => i >= 0);
+      hs = keep.map(i => hs[i]); rs = rs.map(r => keep.map(i => r[i])); slim = true;
+    }
+    raw[pk] = { pageKey: pk, name: name || pk, nameHeader: nh, headers: hs, rows: rs, time: Date.now(), range: range || '', slim };
+    const keys = Object.keys(raw).sort((a, b) => raw[a].time - raw[b].time).filter(k => k !== pk);
+    while (keys.length && JSON.stringify(raw).length > 9e6) delete raw[keys.shift()];
     setRaw(raw);
     return c.rows.length;
   }
@@ -684,13 +701,14 @@
         if (f.to && d > f.to) return false;
         continue;
       }
+      if (f.op === 'empty') { if (String(v == null ? '' : v).trim()) return false; continue; }
       const a = lc(v), b = lc(f.value);
       if (!b) continue;
       if (f.op === 'eq' ? a !== b : f.op === 'not' ? a.includes(b) : !a.includes(b)) return false;
     }
     return true;
   }
-  const activeConds = cs => (cs || []).filter(f => f && f.col && (f.op === 'between' ? (f.from || f.to) : String(f.value || '').trim()));
+  const activeConds = cs => (cs || []).filter(f => f && f.col && (f.op === 'empty' || (f.op === 'between' ? (f.from || f.to) : String(f.value || '').trim())));
 
   // ---- 数据表角色：成交表必须有非零成交金额 + 成交时间/日期，且不是看位/邀约/线索/无效表 ----
   const colHasData = (t, col) => { const i = t.headers.indexOf(col); return i >= 0 && t.rows.some(r => { const v = num(r[i]); return v != null && v !== 0; }); };
@@ -806,6 +824,21 @@
       };
     });
     missCond.forEach(w => warn.push(w));
+    // 期间对齐：有一张「无日期列、按整段范围抓」的表参与 → 全表按这一段统计（每人一行）
+    if (!tpl.__collapsed && gb.length >= 2 && gb.some(isMonthCol)) {
+      const nd = plan.flatMap(x => x.ts.map(y => y.t)).find(t => t.noDate && t.noDate.from !== t.noDate.to);
+      if (nd) {
+        let sub;
+        if (tpl.pivot && tpl.pivot.col) {
+          // 横向展开：把各表月份统一改成这段范围的标签（一列「6–8月」）
+          const lab = rangeLabel(nd.noDate), a = nd.noDate.from, b = nd.noDate.to;
+          const t2 = tables.map(x => { const mi = x.headers.map((h, i) => (isMonthCol(h) ? i : -1)).filter(i => i >= 0); return mi.length ? Object.assign({}, x, { rows: x.rows.map(r => { const c = r.slice(); mi.forEach(i => { if (c[i] >= a && c[i].slice(0, 7) <= b) c[i] = lab; }); return c; }) }) : x; });
+          sub = computeTemplate(Object.assign({}, tpl, { __collapsed: nd, calcs: (tpl.calcs || []).filter(c => !c.delta) }), t2);
+        } else sub = computeTemplate(Object.assign({}, tpl, { __collapsed: nd, groupBy: gb.filter(g => !isMonthCol(g)), pivot: null, calcs: (tpl.calcs || []).filter(c => !c.delta), sort: tpl.sort && isMonthCol(tpl.sort.col) ? null : tpl.sort }), tables);
+        sub.notes = [`「${nd.name}」没有成交时间列，全表按整段 ${rangeText(nd.noDate)} 统计（每人一行）；要分月请在 OCQ 加出成交时间列再抓，或每月各抓一次`].concat(sub.notes || []);
+        return sub;
+      }
+    }
     const formulas = calcs.filter(c => !c.delta).map(c => {
       if (c.share) return { c, f: (o, tot) => (tot && tot[c.share] ? o[c.share] / tot[c.share] : 0) };
       try { return { c, f: compileFormula(c.formula, labels.filter(l => l !== c.label)) }; } catch (e) { warn.push(`计算列「${c.label}」：${e.message}`); return { c, f: () => 0 }; }
@@ -964,7 +997,10 @@
       for (const s of subs) sums.push(Object.assign({}, s, { __sum: true, [gb[0]]: s[gb[0]] + ' 小计', [gb[1]]: '' }));
       if (TOT) { const o = Object.assign({}, TOT); o[gb[0]] = '合计'; gb.slice(1).forEach(h => { o[h] = ''; }); o.__sum = true; sums.push(o); }
     }
-    return { cols: gb.concat(labels), rows, sums, warn, used: [...usedNames], emptyWhy, notes, pick: pickInfo[0] || null, fmt, groupCols: gb, calcLabels: calcs.filter(c => !c.delta).map(c => c.label), deltaCols: deltas.map(c => c.label) };
+    let outCols = gb.concat(labels);
+    outCols = outCols.filter(c => !(deltas.some(d => d.label === c) && rows.every(r => r[c] === '' || r[c] == null)));
+    if (gb.length >= 2) { const mc = gb.find(isMonthCol); if (mc && new Set(rows.map(r => r[mc])).size <= 1) outCols = outCols.filter(c => c !== mc); }
+    return { cols: outCols, rows, sums, warn, used: [...usedNames], emptyWhy, notes, pick: pickInfo[0] || null, fmt, groupCols: gb, calcLabels: calcs.filter(c => !c.delta).map(c => c.label), deltaCols: deltas.map(c => c.label) };
   }
 
   // ---------------- 排行 ----------------
@@ -1140,7 +1176,7 @@
       up: (c, row) => r.deltaCols.includes(c) && typeof row[c] === 'number' && row[c] > 1e-12,
       width: c => autoWidth(c, all, text), freezeCols: r.groupCols.length
     };
-    return { kind: 'tpl', name: tpl.name, file: `OCQ_${safe}_${stamp()}`, sheets: [sheet], warn: r.warn, used: r.used, emptyWhy: r.emptyWhy, notes: r.notes, pick: r.pick, tplId: tpl.id };
+    return { kind: 'tpl', name: tpl.name, file: `OCQ_${safe}_${stamp()}`, sheets: [sheet], warn: r.warn, used: r.used, emptyWhy: r.emptyWhy, notes: r.notes, pick: r.pick, validRule: tpl.validRule || null, validOptions: tpl.presetKey === 'fb3' ? (tpl.validOptions || []) : null, tplId: tpl.id };
   }
   const asView = x => (x && x.sheets ? x : rankingView(x));
 
@@ -1611,7 +1647,7 @@
     const [from, to] = String(tpl.range).split('~');
     if (!from || !to) return tpl;
     let x = null;
-    try { x = fbPresets(from, to).find(p => p.key === tpl.presetKey); } catch (e) { x = null; }
+    try { x = fbPresets(from, to, { validRule: tpl.validRuleUser }).find(p => p.key === tpl.presetKey); } catch (e) { x = null; }
     if (!x) return tpl;
     const n = Object.assign({}, tpl, x.tpl, { id: tpl.id, name: tpl.name });
     if (force || JSON.stringify(n) !== JSON.stringify(tpl)) { const tp = getTpls(), i = tp.findIndex(y => y.id === tpl.id); if (i >= 0) { tp[i] = n; setTpls(tp); } }
@@ -1647,9 +1683,12 @@
     $('warn').textContent = (v.warn || []).join('；');
     $('rkwrap').innerHTML = v.sheets.map((s, si) => `<table class="rk">${v.sheets.length > 1 || si ? `<caption>${esc(s.title)}</caption>` : ''}<tr>${s.cols.map(c => `<th>${esc(c)}</th>`).join('')}</tr>` +
       (s.rows.length ? s.rows.concat(s.sums).map(r => `<tr>${s.cols.map(c => `<td class="${r.__sum ? 's' : s.green(c) ? 'g' : ''} ${s.red(c, r) ? 'red' : s.up && s.up(c, r) ? 'up' : ''}">${esc(s.text(c, r[c]))}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${s.cols.length}" class="muted">${v.emptyWhy ? esc(v.emptyWhy) + ' <button class="mini" id="regen">重新生成</button>' : '（还没有数据）'}</td></tr>`) + '</table>').join('') +
-      (v.used && v.used.length ? `<div class="muted" id="usedLine" style="font-size:11px;margin-top:2px">数据来自：${esc(v.used.join('、'))}` +
+      (v.used && v.used.length ? `<div class="muted" id="usedLine" style="font-size:11px;margin-top:2px">数据来自：${esc(v.used.join('、'))}${v.validRule ? ' · 有效客资＝' + esc(ruleText(v.validRule)) : v.validOptions ? ' · 有效客资：没认出' : ''}` +
         (v.pick && v.pick.cand.length > 1 ? ` <select id="srcPick" style="font-size:11px;max-width:200px"><option value="">换一张表 ▾</option>${v.pick.cand.map(c => `<option value="${esc(c.pk)}">${c.pk === v.pick.cur ? '✓ ' : ''}${esc(c.name)}</option>`).join('')}</select>` : '') + '</div>' : '') +
+      (v.validOptions ? `<div class="muted" style="font-size:11px">有效客资怎么算：<select id="validPick" style="font-size:11px;max-width:260px">${v.validOptions.map((o, i) => `<option value="${i}" ${JSON.stringify(o) === JSON.stringify(v.validRule) ? 'selected' : ''}>${esc(ruleText(o))}</option>`).join('')}${v.validRule ? '' : '<option selected value="">（没认出怎么判断有效，请选一个）</option>'}</select></div>` : '') +
       (v.notes && v.notes.length ? `<div class="muted" style="font-size:11px">${v.notes.map(esc).join('<br>')}</div>` : '');
+    const vp = $('validPick');
+    if (vp) vp.onchange = () => { const tp = getTpls(), t = tp.find(x => x.id === v.tplId); if (!t || vp.value === '') return; t.validRuleUser = v.validOptions[+vp.value]; setTpls(tp); regenPreset(t, true); renderRanking(); };
     const sp = $('srcPick');
     if (sp) sp.onchange = () => { if (!sp.value) return; const tp = getTpls(), t = tp.find(x => x.id === v.tplId); if (!t) return; t.srcPick = Object.assign({}, t.srcPick, { [v.pick.role]: sp.value }); setTpls(tp); renderRanking(); };
     const rg = $('regen');
@@ -1747,13 +1786,31 @@
     const dc = [{ col: '日期', op: 'between', from, to }];
     const score = p => p.t.rows.filter(r => rowPass(p.t, r, dc)).length;
     const best = f => prof.filter(p => ok(p) && f(p)).sort((a, b) => (score(b) > 0) - (score(a) > 0) || b.t.time - a.t.time)[0] || null;
-    return { from, to, order: best(isOrderTab), lead: best(isLeadTab), valid: best(isValidTab) };
+    const valid = prof.filter(p => ok(p) && isValidTab(p) && score(p) > 0).sort((a, b) => b.t.time - a.t.time);
+    return { from, to, order: best(isOrderTab), lead: best(isLeadTab), valid: valid[0] || null, validAll: valid, score };
   }
   function fbConds(R, tabs) {
     const cols = [...new Set(tabs.filter(Boolean).map(chanCol).filter(Boolean))];
     return cols.map(c => ({ col: c, op: 'contains', value: 'facebook' })).concat([{ col: '日期', op: 'between', from: R.from, to: R.to }]);
   }
-  function fbPresets(fromYM, toYM) {
+  const ruleText = r => !r ? '' : r.mode === 'table' ? `用「${r.name || r.table}」表` : r.mode === 'empty' ? `线索表里「${r.cols.join('」和「')}」为空` : `线索表里「${r.col}」${r.op === 'eq' ? '等于' : '含'}「${r.value}」`;
+  function validOptions(R) {
+    const out = R.validAll.map(p => ({ mode: 'table', table: p.t.pageKey, name: p.t.name }));
+    if (R.lead) {
+      const H = R.lead.t.headers.filter(h => !isMonthCol(h) && h !== '日期');
+      const em = H.filter(h => /无效|跑单/.test(h) && /时间|日期/.test(h));
+      if (em.length > 1) out.push({ mode: 'empty', cols: em });
+      em.forEach(h => out.push({ mode: 'empty', cols: [h] }));
+      for (const h of H.filter(h => /状态|是否有效|有效性|判定|结果/.test(h) && !/时间|日期/.test(h))) {
+        const i = R.lead.t.headers.indexOf(h), cnt = {};
+        R.lead.t.rows.forEach(r => { const v = String(r[i] || '').trim(); if (v) cnt[v] = (cnt[v] || 0) + 1; });
+        Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a]).slice(0, 6).forEach(v => out.push({ mode: 'eq', op: 'eq', col: h, value: v }));
+      }
+    }
+    return out;
+  }
+  function fbPresets(fromYM, toYM, opt) {
+    opt = opt || {};
     const R = fbRoles(fromYM, toYM), out = [];
     const rng = `${fromYM}~${toYM}`;
     if (R.order) {
@@ -1763,10 +1820,20 @@
       if (R.lead) {
         const ms = [{ src: '__rows', agg: 'rows', label: '客资', fmt: 'int', table: R.lead.t.pageKey }];
         let rate = '成单/客资', rateName = '成单率(按总客资)';
-        if (R.valid) { ms.push({ src: '__rows', agg: 'rows', label: '有效客资', fmt: 'int', table: R.valid.t.pageKey }); rate = '成单/有效客资'; rateName = '有效客资成单率'; }
-        else if (validityCol(R.lead)) { const vc = validityCol(R.lead); ms.push({ src: '__rows', agg: 'rows', label: '有效客资', fmt: 'int', table: R.lead.t.pageKey, where: [{ col: vc, op: 'contains', value: '有效' }, { col: vc, op: 'not', value: '无效' }] }); rate = '成单/有效客资'; rateName = '有效客资成单率'; }
+        // 有效客资怎么算：用户选的 > 范围内的「判定有效」表 > 线索表「无效/跑单时间」为空 > 状态列含「有效」
+        const opts = validOptions(R);
+        let vr = opt.validRule && opts.some(o => JSON.stringify(o) === JSON.stringify(opt.validRule)) ? opt.validRule : null;
+        if (!vr) vr = opts.find(o => o.mode === 'table') || opts.find(o => o.mode === 'empty') || null;
+        if (!vr && validityCol(R.lead)) { const vc = validityCol(R.lead); vr = { mode: 'eq', op: 'contains', col: vc, value: '有效' }; }
+        if (vr) {
+          const m = vr.mode === 'table' ? { src: '__rows', agg: 'rows', label: '有效客资', fmt: 'int', table: vr.table, role: 'valid' }
+            : { src: '__rows', agg: 'rows', label: '有效客资', fmt: 'int', table: R.lead.t.pageKey, role: 'lead', where: vr.mode === 'empty' ? vr.cols.map(c => ({ col: c, op: 'empty' })) : [{ col: vr.col, op: vr.op || 'eq', value: vr.value }].concat(vr.op === 'contains' ? [{ col: vr.col, op: 'not', value: '无效' }] : []) };
+          ms.push(m); rate = '成单/有效客资'; rateName = '有效客资成单率';
+        }
+        ms[0].role = 'lead';
+        var fb3Valid = { rule: vr, options: opts };
         ms.push({ src: '__rows', agg: 'rows', label: '成单', fmt: 'int', table: R.order.t.pageKey });
-        out.push({ key: 'fb3', name: 'FB·客资与成单率', tpl: { name: 'FB·客资与成单率', groupBy: ['顾问', '月份'], filters: fbConds(R, [R.order, R.lead, R.valid]), metrics: ms, calcs: [{ label: rateName, formula: rate, fmt: 'pct' }, { label: '浮动', delta: rateName, formula: '', fmt: 'pctd' }], sort: { col: '成单', dir: 'desc' }, red: {}, total: true } });
+        out.push({ key: 'fb3', name: 'FB·客资与成单率', tpl: { name: 'FB·客资与成单率', validRule: fb3Valid.rule, validOptions: fb3Valid.options, groupBy: ['顾问', '月份'], filters: fbConds(R, [R.order, R.lead, fb3Valid.rule && fb3Valid.rule.mode === 'table' ? R.validAll.find(p => p.t.pageKey === fb3Valid.rule.table) : null]), metrics: ms, calcs: [{ label: rateName, formula: rate, fmt: 'pct' }, { label: '浮动', delta: rateName, formula: '', fmt: 'pctd' }], sort: { col: '成单', dir: 'desc' }, red: {}, total: true } });
       }
     }
     const nameOf = pk => (colProfile().find(p => p.t.pageKey === pk) || { t: { name: pk } }).t.name;
@@ -2266,7 +2333,12 @@
         const money = t.headers.filter(h => /金额|收款|未收/.test(h)).map(h => ({ h, nonZero: colHasData(t, h) }));
         return { name: t.name, rows: t.rows.length, range: t.range || '', grabbed: t.time ? new Date(t.time).toISOString() : '', headers: t.headers, nameHeader: t.nameHeader || '',
           person: v.headers.includes('顾问') ? (t.nameHeader || '(自动)') : '(没认出)', dateCol: v.dateCol || '', dateCols: v.dateCols || [], money,
-          role: v.headers.length ? tableRole(v) : '', sample: t.rows.slice(0, 3).map(r => Object.fromEntries(t.headers.map((h, i) => [h, cut(r[i])]))) };
+          role: v.headers.length ? tableRole(v) : '', slim: !!t.slim,
+          status: t.headers.filter(h => /状态|是否|判定|结果|有效|无效|跑单|进度/.test(h)).map(h => {
+            const i = t.headers.indexOf(h), cnt = {}; let empty = 0;
+            t.rows.forEach(r => { const x = String(r[i] || '').trim(); if (!x) empty++; else { const k = parseDate(x) ? '(日期)' : x.slice(0, 20); cnt[k] = (cnt[k] || 0) + 1; } });
+            return { h, empty, top: Object.entries(cnt).sort((a, b) => b[1] - a[1]).slice(0, 10) };
+          }), sample: t.rows.slice(0, 3).map(r => Object.fromEntries(t.headers.map((h, i) => [h, cut(r[i])]))) };
       }),
       templates: getTpls().map(x => ({ name: x.name, presetKey: x.presetKey || '', groupBy: x.groupBy, metrics: (x.metrics || []).map(m => `${m.label}←${m.src}@${m.table || ''}`), srcPick: x.srcPick || null }))
     };
