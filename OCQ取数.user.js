@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.5.4
+// @version      0.5.5
 // @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -60,7 +60,7 @@
     if (/^\(.*\)$/.test(t)) { neg = true; t = t.slice(1, -1); }
     t = t.replace(/[−–—]/g, '-');
     if (/^-/.test(t)) neg = true;
-    t = t.replace(/[,，\s元¥￥%％]/g, '').replace(/^-/, '');
+    t = t.replace(/^(HK\$|HKD|MOP|RMB|CNY|US\$|\$)\s*/i, '').replace(/[,，\s元¥￥%％$]/g, '').replace(/^-/, '');
     const m = t.match(/^\d+(\.\d+)?$/) || t.match(/^\d+(\.\d+)?万$/);
     if (!m) return null;
     let v = parseFloat(t);
@@ -98,9 +98,15 @@
   }
   function cellText(el) {
     if (!el) return '';
-    const cell = el.querySelector && el.querySelector('.cell');
-    return ((cell || el).innerText || (cell || el).textContent || '').replace(/\u00a0/g, ' ').trim();
+    const c = (el.querySelector && el.querySelector('.cell')) || el;
+    // innerText 对 visibility:hidden（Element 固定列在主表里的副本 td.is-hidden）返回空 → 回退 textContent
+    return (String(c.innerText || '').trim() || String(c.textContent || '')).replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
   }
+  /** 表头规范化：去空白、排序/筛选图标、全角→半角 */
+  const hnorm = s => String(s == null ? '' : s)
+    .replace(/[\uff10-\uff19\uff21-\uff3a\uff41-\uff5a]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xfee0)).replace(/\u3000/g, ' ')
+    .replace(/[\u2190-\u21ff\u25a0-\u25ff\u2600-\u27bf\ue000-\uf8ff]/g, '')
+    .replace(/\s+/g, '').trim();
 
   // ---------------- 表格解析 ----------------
   function parseTable(root) {
@@ -113,15 +119,23 @@
         || [...box.querySelectorAll('.el-table__body-wrapper')].find(w => !w.closest('.el-table__fixed, .el-table__fixed-left, .el-table__fixed-right'));
       if (!hw || !bw) return null;
       const ths = [...hw.querySelectorAll('thead th')].filter(th => !th.classList.contains('gutter'));
+      const colCls = el => (String(el.className || '').match(/el-table_\d+_column_\d+/) || [''])[0];
+      // 固定列（左/右）单独渲染：按列 class + 行号合并
+      const fixedTh = new Map(), fixedTd = new Map();
+      for (const fx of box.querySelectorAll('.el-table__fixed, .el-table__fixed-right, .el-table__fixed-left')) {
+        fx.querySelectorAll('thead th').forEach(th => { const k = colCls(th); const v = hnorm(cellText(th)); if (k && v && !th.classList.contains('is-hidden')) fixedTh.set(k, v); });
+        const fb = fx.querySelector('.el-table__fixed-body-wrapper, .el-table__body-wrapper');
+        if (fb) [...fb.querySelectorAll('tbody tr')].forEach((tr, ri) => tr.querySelectorAll(':scope > td').forEach(td => { const k = colCls(td); if (k && !td.classList.contains('is-hidden')) { const v = cellText(td); if (v) fixedTd.set(k + '#' + ri, v); } }));
+      }
       const headers = ths.map((th, i) => {
-        const t = norm(cellText(th));
+        const t = hnorm(cellText(th)) || fixedTh.get(colCls(th)) || '';
         if (t) return t;
         if (th.classList.contains('el-table-column--selection') || th.querySelector('.el-checkbox')) return `__sel${i}`;
         return `__col${i}`;
       });
-      const rows = [...bw.querySelectorAll('tbody tr')].map(tr => {
+      const rows = [...bw.querySelectorAll('tbody tr')].map((tr, ri) => {
         const tds = [...tr.querySelectorAll(':scope > td')];
-        return headers.map((_, i) => tds[i] ? cellText(tds[i]) : '');
+        return headers.map((_, i) => (tds[i] ? cellText(tds[i]) || fixedTd.get(colCls(tds[i]) + '#' + ri) || '' : ''));
       }).filter(r => r.some(c => c));
       return { headers, rows };
     }
@@ -129,7 +143,7 @@
     if (!table) return null;
     const ths = [...table.querySelectorAll('thead th')];
     if (ths.length) {
-      const headers = ths.map((th, i) => norm(cellText(th)) || `__col${i}`);
+      const headers = ths.map((th, i) => hnorm(cellText(th)) || `__col${i}`);
       const rows = [...table.querySelectorAll('tbody tr')].map(tr => {
         const tds = [...tr.children];
         return headers.map((_, i) => tds[i] ? cellText(tds[i]) : '');
@@ -681,9 +695,9 @@
   function rawTables(roster) {
     const ro = new Map((roster || []).map(r => [norm(r.name), r]));
     return Object.values(getRaw()).map(t => {
-      let headers = t.headers.slice(), rows = t.rows;
-      const base = t.headers;
-      let ni = t.nameHeader ? headers.indexOf(t.nameHeader) : -1;
+      const base = t.headers.map(h => hnorm(h) || h);
+      let headers = base.slice(), rows = t.rows;
+      let ni = t.nameHeader ? headers.indexOf(hnorm(t.nameHeader)) : -1;
       if (ni < 0 || personScore(t.rows, ni, headers[ni]) <= 0.5) { const b = bestPersonIdx(base, t.rows); if (b >= 0) ni = b; }
       const add = [];
       if (ni >= 0 && !headers.includes('顾问')) add.push(['顾问', r => r[ni]]);
@@ -718,7 +732,13 @@
     const qualifying = (tables, m, gb, role) => {
       const ok = t => (m.src === '__rows' || (t.headers.includes(m.src) && (!/金额|收款|未收|合同/.test(m.src) || colHasData(t, m.src)))) && gb.every(g => t.headers.includes(g)) && (!role || tableRole(t) === role);
       const sc = t => (role === 'order' && ORDER_DATE.test(t.dateCol || '') ? 4 : 0) + (passRows(t, m).length ? 8 : 0);
-      return tables.filter(ok).sort((a, b) => sc(b) - sc(a) || (b.time || 0) - (a.time || 0));
+      let list = tables.filter(ok);
+      if (!list.length && role === 'order') {
+        // 兜底：放宽为「有成交金额列、不是看位/邀约/线索/无效表」
+        list = tables.filter(t => !/看位|邀约|线索|无效/.test(t.name) && (m.src === '__rows' || t.headers.includes(m.src)) && gb.every(g => t.headers.includes(g)) && t.headers.includes('成交金额'));
+        if (list.length) warn.push(`没有完全符合的成交表，先用「${list[0].name}」（建议点「高级设置 › 已抓的数据 › 复制诊断信息」发给我）`);
+      }
+      return list.sort((a, b) => sc(b) - sc(a) || (b.time || 0) - (a.time || 0));
     };
     const baseOf = pk => String(pk || '').split('·')[0];
     const roleOf = tableRole;
@@ -738,7 +758,15 @@
         if (!pickInfo.length || role === 'order') pickInfo.unshift({ role: role || '_', cand: cand.map(t => ({ pk: t.pageKey, name: t.name })), cur: pick ? pick.pageKey : '' });
       } else ts = tables.filter(fits);
       ts.forEach(t => usedNames.add(t.name));
-      if (!ts.length) warn.push(`「${m.label}」：还没有同时带「${m.src}」和「${gb.join('、')}」的已抓表`);
+      if (!ts.length) {
+        const miss = tables.filter(t => !/看位|邀约|线索|无效/.test(t.name)).map(t => {
+          const need = [m.src === '__rows' ? '' : m.src].concat(gb).filter(Boolean).filter(h => !t.headers.includes(h));
+          if (!need.length && m.src !== '__rows' && !colHasData(t, m.src)) need.push(`${m.src}(全是空/0)`);
+          if (!need.length && (m.src === '成交金额' || /成交|成单/.test(m.label)) && !t.headers.some(h => ORDER_DATE.test(h))) need.push('成交时间');
+          return need.length ? `「${t.name}」缺 ${need.join('、')}` : '';
+        }).filter(Boolean).slice(0, 3);
+        warn.push(`「${m.label}」：还没有同时带「${m.src}」和「${gb.join('、')}」的已抓表` + (miss.length ? `（${miss.join('；')}；缺的列请重新打开该表点「抓当前这张表」）` : ''));
+      }
       return {
         m, ts: ts.map(t => {
           conds.filter(f => !t.headers.includes(f.col)).forEach(f => missCond.add(`「${t.name}」没有「${f.col}」列，这个条件没用在它上面`));
@@ -1418,7 +1446,7 @@
           <div>人员列：<select id="namecol"></select> <button class="mini" id="rescan">重新识别</button></div>
           <table class="cols"><thead><tr><th></th><th>表头</th><th>类型</th><th>怎么算</th><th>算进排行的哪一列</th></tr></thead><tbody id="cols"></tbody></table>
         </details>
-        <details><summary>已抓的数据</summary><div class="list" id="sources"></div><div class="muted" id="rawInfo"></div></details>
+        <details><summary>已抓的数据</summary><div class="list" id="sources"></div><div class="muted" id="rawInfo"></div><button class="mini" id="diag">复制诊断信息</button> <span class="muted" id="diagMsg"></span></details>
         <details><summary>报表导出 / 导入（JSON）</summary>
           <div><button class="btn" id="tplExp">导出全部报表</button><button class="btn" id="tplImp">导入</button></div>
           <textarea id="tplJson" rows="3" placeholder="导入：把导出的 JSON 粘到这里再点「导入」"></textarea><div class="muted" id="tplMsg"></div>
@@ -2173,6 +2201,27 @@
   });
   $('xlsx').onclick = async () => { const v = renderRanking(); if (!v || !v.sheets[0].rows.length) return alert('还没有数据'); await exportExcel(v); };
   $('img').onclick = async () => { const v = renderRanking(); if (!v || !v.sheets[0].rows.length) return alert('还没有数据'); $('prog').textContent = await copyImage(v); };
+  function diagInfo() {
+    const cut = v => { v = String(v == null ? '' : v); return v.length > 24 ? v.slice(0, 24) + '…' : v; };
+    const raw = Object.values(getRaw()), vt = rawTables(getRoster());
+    return {
+      version: (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '', time: new Date().toISOString(),
+      sources: getSources().map(s => ({ label: s.label, page: s.pageName || s.pageKey || '', people: Object.keys(s.data || {}).length })),
+      raw: raw.map(t => {
+        const v = vt.find(x => x.pageKey === t.pageKey) || { headers: [] };
+        const money = t.headers.filter(h => /金额|收款|未收/.test(h)).map(h => ({ h, nonZero: colHasData(t, h) }));
+        return { name: t.name, rows: t.rows.length, range: t.range || '', grabbed: t.time ? new Date(t.time).toISOString() : '', headers: t.headers, nameHeader: t.nameHeader || '',
+          person: v.headers.includes('顾问') ? (t.nameHeader || '(自动)') : '(没认出)', dateCol: v.dateCol || '', dateCols: v.dateCols || [], money,
+          role: v.headers.length ? tableRole(v) : '', sample: t.rows.slice(0, 3).map(r => Object.fromEntries(t.headers.map((h, i) => [h, cut(r[i])]))) };
+      }),
+      templates: getTpls().map(x => ({ name: x.name, presetKey: x.presetKey || '', groupBy: x.groupBy, metrics: (x.metrics || []).map(m => `${m.label}←${m.src}@${m.table || ''}`), srcPick: x.srcPick || null }))
+    };
+  }
+  $('diag').onclick = async () => {
+    const s = JSON.stringify(diagInfo(), null, 1);
+    try { if (typeof GM_setClipboard === 'function') GM_setClipboard(s, 'text'); else await navigator.clipboard.writeText(s); $('diagMsg').textContent = `已复制（${Math.round(s.length / 1024)} KB），直接粘贴发给我`; }
+    catch (e) { $('diagMsg').textContent = '复制失败：' + e.message; }
+  };
   $('clear').onclick = () => { if (!confirm('清空已抓的数据？（名单、步骤、报表都保留）')) return; setSources([]); setRaw({}); setLog([]); $('prog').textContent = ''; renderAll(); };
   $('imp').onclick = () => {
     const r = parsePaste($('paste').value);
