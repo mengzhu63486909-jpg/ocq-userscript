@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.5.1
+// @version      0.5.2
 // @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -517,6 +517,24 @@
     return { sources: out, lines };
   }
 
+  /** 一列像不像人名列：去重后人名占比 */
+  const NOT_PERSON_HDR = /渠道|来源|项目|地址|客户|电话|手机|进度|情况|类型|部门|小组|供应商|门店|方式|状态|称呼|日期|时间|金额/;
+  function personScore(rows, i, header) {
+    if (header != null && NOT_PERSON_HDR.test(header)) return 0;
+    const names = new Set(rows.map(r => String(r[i] || '').trim()).filter(n => n && !/合计|总计/.test(n)));
+    if (!names.size) return 0;
+    return [...names].filter(looksLikePersonName).length / names.size;
+  }
+  /** 自动找人员列：优先 沟通负责人/顾问/业务员/销售/负责人，再看人名占比 */
+  function bestPersonIdx(headers, rows, prefer) {
+    const ok = i => i >= 0 && personScore(rows, i, headers[i]) > 0.5;
+    if (ok(prefer)) return prefer;
+    for (const re of [/^沟通负责人$/, /^顾问$/, /^(业务员|销售|销售顾问|负责人)$/, /负责人|顾问|业务员|销售/]) {
+      const c = headers.map((h, i) => i).filter(i => re.test(headers[i]) && !/地址|项目|客户|电话|渠道|设计|创建|提供/.test(headers[i]) && ok(i));
+      if (c.length) return c.reduce((a, b) => (personScore(rows, b, headers[b]) > personScore(rows, a, headers[a]) ? b : a));
+    }
+    return -1;
+  }
   function namesLookWrong(rows, nameIdx) {
     const names = new Set(rows.map(r => (r[nameIdx] || '').trim()).filter(n => n && !/合计|总计/.test(n)));
     const bad = [...names].filter(n => !looksLikePersonName(n)).length;
@@ -1316,7 +1334,7 @@
   .wbig{font-size:15px;padding:9px 18px}.wnav{display:flex;align-items:center;gap:6px;margin-top:12px}.wnav .sp{flex:1}
   .wsteps{display:flex;align-items:center;gap:4px;margin-bottom:6px}.wsteps span{width:22px;height:22px;border-radius:50%;background:#eee;color:#888;display:inline-flex;align-items:center;justify-content:center;font-size:12px}
   .wsteps span.cur{background:#ff6a00;color:#fff}.wsteps span.done{background:#ffd9bf;color:#c55a00}.wsteps i{width:24px;height:2px;background:#eee}
-  .adv{margin-top:10px}.chip.sm{padding:3px 8px;font-size:12px}.fr{margin:4px 0;padding:4px 0;border-bottom:1px dashed #eee}.sec{margin:6px 0}
+  .adv{margin-top:10px}.gbtn{margin:0;min-width:96px}.morecols{border:none;padding:0;margin:6px 0}.morecols summary{font-weight:normal}.ck.sm{font-size:12px;padding:3px 6px}.chip.sm{padding:3px 8px;font-size:12px}.fr{margin:4px 0;padding:4px 0;border-bottom:1px dashed #eee}.sec{margin:6px 0}
   textarea{width:100%;font-size:12px}
   </style>
   <button class="fab" id="fab" title="OCQ取数">OCQ</button>
@@ -1334,8 +1352,9 @@
       <div class="editor" id="newBox" style="display:none">
         <div class="wq">快速报表 <span class="muted">点一下就出</span><button class="mini" id="newClose" style="float:right">×</button></div>
         <div class="chips" id="presetBtns"></div>
-        <div class="wq" style="font-size:14px;margin-top:10px">Facebook 分析　<span class="muted">月份</span> <input type="month" id="pFrom"> ~ <input type="month" id="pTo"></div>
-        <div class="chips" id="fbBtns"></div><div class="warn" id="newMsg"></div>
+        <details class="morecols" id="fbBox"><summary class="muted">Facebook 分析 ▾</summary>
+          <div style="margin:4px 0"><span class="muted">月份</span> <input type="month" id="pFrom"> ~ <input type="month" id="pTo"></div>
+          <div class="chips" id="fbBtns"></div></details><div class="warn" id="newMsg"></div>
         <button class="btn p wbig" id="ownBtn" style="margin-top:8px">＋ 自己建一个</button>
       </div>
       <div class="editor" id="wiz" style="display:none"><div id="wizBody"></div></div>
@@ -1426,7 +1445,8 @@
     scan = Object.assign({ parsed: t.parsed }, a);
     const saved = getPrefs()[pageKey()];
     let nameIdx = a.nameIdx;
-    if (saved && saved.nameKey) { const c = a.cols.find(c => c.key === saved.nameKey); if (c) nameIdx = c.idx; }
+    if (saved && saved.nameKey) { const c = a.cols.find(c => c.key === saved.nameKey); if (c && personScore(t.parsed.rows, c.idx, c.header) > 0.5) nameIdx = c.idx; }
+    if (nameIdx < 0 || personScore(t.parsed.rows, nameIdx, t.parsed.headers[nameIdx]) <= 0.5) { const b = bestPersonIdx(t.parsed.headers, t.parsed.rows, nameIdx); if (b >= 0) nameIdx = b; }
     const tot = parseTotal();
     $('tblinfo').textContent = `这页「${pageKey()}」` + (tot != null ? `共 ${tot} 条` : `${t.parsed.rows.length} 行`) + (getSteps().some(s => s.pageKey === pageKey()) ? ' · 已在取数步骤里' : '') + (scanRange.hist ? ` · 是 ${scanRange.tag} 的数据（存成历史数据）` : '');
     const shown = a.cols.filter(c => !/^__sel/.test(c.header));
@@ -1662,7 +1682,6 @@
       const orig = (getRaw()[p.t.pageKey] || {}).headers || [];
       for (const c of p.cols) {
         if (c.numeric || m.has(c.h)) continue;
-        if (c.h === '顾问' && !orig.includes('顾问')) continue;          // 已有原始人员列，不重复
         if (c.filled >= 20 && c.distinct / c.filled > 0.9) continue;      // 项目名/编号这类每行都不同，不适合分组
         m.set(c.h, c);
       }
@@ -1677,7 +1696,36 @@
     }
     return [...m.values()].sort((a, b) => b.money - a.money);
   }
-  const chip = (c, on, kind) => `<button class="btn chip ${on ? 'on' : ''}" data-k="${kind}" data-h="${esc(c.h)}">${esc(c.h)}<span class="muted">（例：${esc(String(c.example).slice(0, 12))}）</span></button>`;
+  const wizOpen = {};
+  const COMMON_GROUPS = [
+    ['按顾问', cs => cs.find(h => h === '顾问') || cs.find(h => h === '沟通负责人') || cs.find(h => /^(销售|销售顾问|业务员)$/.test(h))],
+    ['按小组', cs => cs.find(h => h === '所属小组')],
+    ['按渠道', cs => cs.find(h => h === '渠道来源') || cs.find(h => /渠道/.test(h))],
+    ['按房子情况', cs => cs.find(h => h === '客户房子情况') || cs.find(h => /房子情况/.test(h))],
+    ['按房屋类型', cs => cs.find(h => h === '房屋类型')],
+    ['按月份', cs => cs.find(h => h === '月份')]
+  ];
+  /** 常用分组 ≤6 个大按钮，其余收在「更多列 ▾」里（日期类排最后） */
+  function groupPicker(prof, list, sel, kind, moreKey) {
+    const dates = new Set(); prof.forEach(p => (p.t.dateCols || []).forEach(h => dates.add(h)));
+    const isDateish = h => dates.has(h) || /^月份\(/.test(h) || h === '日期' || /日期|时间/.test(h);
+    const hs = list.map(c => c.h);
+    const main = [];
+    for (const [lab, f] of COMMON_GROUPS) { const h = f(hs); if (h && !main.some(m => m.h === h)) main.push({ lab, h }); }
+    const used = new Set(main.map(m => m.h));
+    if (used.has('顾问')) used.add('沟通负责人');
+    const rest = list.filter(c => !used.has(c.h));
+    const normal = rest.filter(c => !isDateish(c.h)).sort((a, b) => a.h.localeCompare(b.h, 'zh'));
+    const dateish = rest.filter(c => isDateish(c.h)).sort((a, b) => a.h.localeCompare(b.h, 'zh'));
+    const selInRest = rest.some(c => c.h === sel);
+    let h = `<div class="chips">${main.map(m => `<button class="btn wbig gbtn ${m.h === sel ? 'chip on' : ''}" data-k="${kind}" data-h="${esc(m.h)}">${m.lab}</button>`).join('') || '<span class="muted">（没有常用分组列，展开「更多列」选）</span>'}</div>`;
+    if (rest.length) {
+      h += `<details class="morecols" data-mk="${moreKey}" ${wizOpen[moreKey] || selInRest ? 'open' : ''}><summary class="muted">更多列 ▾</summary><div class="chips">${normal.map(c => chip(c, sel === c.h, kind)).join('')}</div>` +
+        (dateish.length ? `<div class="muted" style="margin-top:6px">日期 / 月份</div><div class="chips">${dateish.map(c => chip(c, sel === c.h, kind)).join('')}</div>` : '') + '</details>';
+    }
+    return h;
+  }
+  const chip = (c, on, kind) => `<button class="btn chip sm ${on ? 'on' : ''}" data-k="${kind}" data-h="${esc(c.h)}" title="例：${esc(String(c.example).slice(0, 20))}">${esc(c.h)}</button>`;
   const metricLabels = () => ed.metrics.map(m => m.label).concat(ed.calcs.filter(c => c.label).map(c => c.label));
   function renderWizard() {
     const prof = colProfile();
@@ -1685,16 +1733,15 @@
     let h = `<div class="wsteps">${[1, 2, 3].map(i => `<span class="${i === wizStep ? 'cur' : i < wizStep ? 'done' : ''}">${i}</span>`).join('<i></i>')}</div>`;
     if (!prof.length) h += '<div class="warn">还没有抓到明细表：先点「⚡ 一键取数」或打开明细表点「抓当前这张表」。</div>';
     if (wizStep === 1) {
-      const tc = textCols(prof);
-      h += `<div class="wq">按什么分组？</div><div class="chips">${tc.map(c => chip(c, ed.groupBy[0] === c.h, 'g1')).join('') || '<span class="muted">（没有可分组的文字列）</span>'}</div>`;
+      h += `<div class="wq">按什么分组？</div>` + groupPicker(prof, textCols(prof), ed.groupBy[0], 'g1', 'more1');
       if (ed.groupBy[0]) {
         if (!wizSub) h += `<a href="#" class="more" data-w="sub">＋ 再细分一层</a>`;
         else {
           const tc2 = textCols(prof, [ed.groupBy[0]]).filter(c => c.h !== ed.groupBy[0]);
-          h += `<div class="muted" style="margin-top:8px">再细分一层（可不选）<a href="#" class="more" data-w="nosub">　不细分</a></div><div class="chips">${tc2.map(c => chip(c, ed.groupBy[1] === c.h, 'g2')).join('')}</div>`;
+          h += `<div class="muted" style="margin-top:8px">再细分一层（可不选）<a href="#" class="more" data-w="nosub">　不细分</a></div>` + groupPicker(prof, tc2, ed.groupBy[1], 'g2', 'more2');
         }
       }
-      h += filterHtml(prof);
+      h += (ed.filters && ed.filters.length) || wizOpen.filt ? filterHtml(prof) : `<div style="margin-top:8px"><a href="#" class="more" data-w="openF">＋ 只看部分行（如只看 Facebook、某段日期）</a></div>`;
       if (ed.groupBy[0] && !ed.groupBy[1]) h += `<details class="adv" ${ed.mergeSmall ? 'open' : ''}><summary>高级</summary><label><input type="checkbox" id="wMerge" ${ed.mergeSmall ? 'checked' : ''}> 小渠道合并成其他 <span class="muted">（只留占比 ≥1% 的前 15 个）</span></label></details>`;
       h += nav(false, `<button class="btn p wbig" data-w="next" ${ed.groupBy[0] ? '' : 'disabled'}>下一步 →</button>`);
     } else if (wizStep === 2) {
@@ -1703,10 +1750,15 @@
       const key = (pk, src) => esc(pk + '\u0001' + src);
       h += `<div class="wq">要看哪些数？</div>`;
       tabs.forEach((p, ti) => {
-        const ncs = p.cols.filter(c => c.numeric).sort((a, b) => b.money - a.money);
+        const COMMON_NUM = ['成交金额', '变动金额', '累计收款', '合同未收'];
+        const allN = p.cols.filter(c => c.numeric);
+        const ncs = COMMON_NUM.map(h => allN.find(c => c.h === h)).filter(Boolean);
+        const others = allN.filter(c => !COMMON_NUM.includes(c.h)).sort((a, b) => a.h.localeCompare(b.h, 'zh'));
+        const mk = 'n' + ti, otherOpen = wizOpen[mk] || others.some(c => has(p.t.pageKey, c.h));
         h += `<div class="muted" style="margin:8px 0 4px">${ti ? `来自另一张表「${esc(p.t.name)}」<span class="muted">（按「${esc(ed.groupBy.join(' / '))}」对上）</span>` : `来自「${esc(p.t.name)}」`}</div><div class="checks">` +
           `<label class="ck"><input type="checkbox" data-m="${key(p.t.pageKey, '__rows')}" ${has(p.t.pageKey, '__rows') ? 'checked' : ''}> ${ti ? `单数 · ${esc(p.t.name)}` : '单数（条数）'}</label>` +
-          ncs.map(c => `<label class="ck"><input type="checkbox" data-m="${key(p.t.pageKey, c.h)}" ${has(p.t.pageKey, c.h) ? 'checked' : ''}> ${esc(c.h)}${ti ? ' · ' + esc(p.t.name) : ''} <span class="muted">${c.money ? '金额，求和' : '求和'}</span></label>`).join('') + '</div>';
+          ncs.map(c => `<label class="ck"><input type="checkbox" data-m="${key(p.t.pageKey, c.h)}" ${has(p.t.pageKey, c.h) ? 'checked' : ''}> ${esc(c.h)}${ti ? ' · ' + esc(p.t.name) : ''} <span class="muted">${c.money ? '金额，求和' : '求和'}</span></label>`).join('') + '</div>' +
+          (others.length ? `<details class="morecols" data-mk="${mk}" ${otherOpen ? 'open' : ''}><summary class="muted">更多 ▾（${others.length} 列）</summary><div class="checks">${others.map(c => `<label class="ck sm"><input type="checkbox" data-m="${key(p.t.pageKey, c.h)}" ${has(p.t.pageKey, c.h) ? 'checked' : ''}> ${esc(c.h)}${ti ? ' · ' + esc(p.t.name) : ''}</label>`).join('')}</div></details>` : '');
       });
       h += `<details class="adv" ${ed.metrics.some(m => m.agg !== 'sum' && m.agg !== 'rows') || ed.calcs.some(c => c.formula) ? 'open' : ''}><summary>高级</summary>` +
         (ed.metrics.filter(m => m.src !== '__rows').length ? '<div class="muted">怎么算：</div>' + ed.metrics.filter(m => m.src !== '__rows').map(m => `<div class="er">${esc(baseLabel(m))} <select data-agg="${esc(m.table + '\u0001' + m.src)}">${objOpt({ sum: '求和', avg: '平均', max: '最大', min: '最小', distinct: '去重计数' }, m.agg)}</select></div>`).join('') : '') +
@@ -1860,6 +1912,7 @@
       else if (w === 'done') { finishWizard(); return; }
       else if (w === 'addC') ed.calcs.push({ label: '', formula: '' });
       else if (w === 'addDelta') { const x = (ed.calcs.filter(c => !c.delta && !c.share).slice(-1)[0] || ed.metrics[0] || {}).label; if (x && !ed.calcs.some(c => c.delta === x)) ed.calcs.push({ label: x + '浮动', delta: x, formula: '' }); }
+      else if (w === 'openF') { wizOpen.filt = true; ed.filters = ed.filters || []; if (!ed.filters.length) ed.filters.push({ col: '', op: 'contains', value: '' }); }
       else if (w === 'addF') ed.filters.push({ col: '', op: 'contains', value: '' });
       else if (w === 'rmF') ed.filters.splice(+b.closest('.fr').dataset.f, 1);
       else if (w === 'fv') { const f = ed.filters[+b.closest('.fr').dataset.f]; f.value = b.dataset.v; if (f.op === 'between') f.op = 'contains'; }
@@ -1868,6 +1921,7 @@
     }
     renderWizard();
   });
+  $('wizBody').addEventListener('toggle', e => { const d = e.target; if (d.dataset && d.dataset.mk) wizOpen[d.dataset.mk] = d.open; }, true);
   $('wizBody').addEventListener('change', e => {
     const t = e.target;
     if (t.dataset.m != null) {
@@ -1958,7 +2012,7 @@
     if (!scan) return;
     savePrefs();
     const choices = currentChoices();
-    const nameIdx = +$('namecol').value;
+    let nameIdx = +$('namecol').value;
     const picked = [];
     for (const c of scan.cols) {
       const ch = choices[c.key];
@@ -1971,6 +2025,13 @@
     try {
       const res = await scrapeAll((p, n, tot, note) => { $('prog').textContent = note || `正在抓第 ${p} 页（${n}/${tot != null ? tot : '?'}）`; }, nameIdx >= 0 ? nameIdx : fallbackIdx(scan.parsed));
       if (!res.ok) { $('prog').textContent = res.error; return; }
+      if (nameIdx < 0 || namesLookWrong(res.rows, nameIdx) || personScore(res.rows, nameIdx, res.headers[nameIdx]) <= 0.5) {
+        const b = bestPersonIdx(res.headers, res.rows, nameIdx);
+        if (b >= 0 && b !== nameIdx) {
+          const nc = scan.cols.find(c => c.idx === b);
+          if (nc) { const old = nameIdx; nameIdx = b; $('namecol').value = String(b); savePrefs(); for (const pk of picked) if (pk.mode === 'count' && pk.idx === old) Object.assign(pk, { idx: b, header: nc.header, key: nc.key, display: nc.display }); }
+        }
+      }
       if (picked.length && namesLookWrong(res.rows, nameIdx)) { askPick('没认出哪列是顾问：到「⚙ 更多 › 高级设置 › 这张表抓哪些列」选好「人员列」再抓'); return; }
       const addStep = $('addStep').checked;
       let rg = pageRange(null);
@@ -2068,6 +2129,6 @@
   window.__ocqUS = W.__ocqUS = {
     openPanel, doScan, startGrab, startReplay, runReplay, getSources, getSteps, setSteps, computeRanking, getRoster, getSettings,
     parsePaste, num, analyze, exportExcel, drawCanvas, summaryRows, infoLine, timeProgress, redCut, setSettingsForTest: setSettings, findBestTable, rewriteMonthDates, root, isBusy: () => busy, isReplaying: () => replaying, FIXED_COLS,
-    getRaw, getTpls, saveTemplate, availablePresets, applyPreset, collapseProg, fbPresets, applyFb, pageRange, parseDate, lastFullMonths, getUI: () => gmGet('ocq_ui', {}), buildPreset, openNewBox, openWizard, importTemplates, computeTemplate, compileFormula, rawTables, currentView, templateView, rankingView, groupRanking, openEditor, setRosterForTest: setRoster, renderAll
+    getRaw, getTpls, saveTemplate, availablePresets, applyPreset, collapseProg, bestPersonIdx, fbPresets, applyFb, pageRange, parseDate, lastFullMonths, getUI: () => gmGet('ocq_ui', {}), buildPreset, openNewBox, openWizard, importTemplates, computeTemplate, compileFormula, rawTables, currentView, templateView, rankingView, groupRanking, openEditor, setRosterForTest: setRoster, renderAll
   };
 })();
