@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.4.3
+// @version      0.5.0
 // @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -550,10 +550,10 @@
     }
     return { headers: hs, rows: out };
   }
-  function storeRaw(pk, name, res, nameIdx) {
+  function storeRaw(pk, name, res, nameIdx, range) {
     const c = cleanRaw(res.headers, res.rows, nameIdx);
     const raw = getRaw();
-    raw[pk] = { pageKey: pk, name: name || pk, nameHeader: nameIdx >= 0 ? res.headers[nameIdx] : '', headers: c.headers, rows: c.rows, time: Date.now() };
+    raw[pk] = { pageKey: pk, name: name || pk, nameHeader: nameIdx >= 0 ? res.headers[nameIdx] : '', headers: c.headers, rows: c.rows, time: Date.now(), range: range || '' };
     const keys = Object.keys(raw).sort((a, b) => raw[a].time - raw[b].time);
     while (keys.length > 1 && JSON.stringify(raw).length > 4e6) delete raw[keys.shift()];
     setRaw(raw);
@@ -606,17 +606,69 @@
     if (p < toks.length) throw new Error('公式写法不对');
     return f;
   }
-  /** 已抓明细表（附加虚拟列：顾问 = 人员列，所属小组 = 名单里的小组） */
+  // ---------------- 日期 / 行筛选 ----------------
+  function parseDate(s) {
+    const m = String(s == null ? '' : s).match(/(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})/);
+    if (!m) return '';
+    const y = +m[1], mo = +m[2], d = +m[3];
+    if (y < 2000 || y > 2100 || mo < 1 || mo > 12 || d < 1 || d > 31) return '';
+    return `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  }
+  const ymOf = s => { const d = parseDate(s); return d ? d.slice(0, 7) : ''; };
+  const DATE_PRI = [/成交|签约|下单|订单/, /创建|录入|分配|登记|进线|获客/, /日期/, /时间/];
+  function detectDateCols(headers, rows) {
+    const out = [];
+    headers.forEach((h, i) => {
+      if (/^月份|^日期$/.test(h)) return;
+      const vals = rows.map(r => r[i]).filter(v => String(v || '').trim()).slice(0, 300);
+      if (vals.length && vals.filter(v => parseDate(v)).length / vals.length >= 0.8) out.push(i);
+    });
+    return out;
+  }
+  function primaryDate(headers, idxs) {
+    for (const re of DATE_PRI) { const i = idxs.find(i => re.test(headers[i])); if (i != null) return i; }
+    return idxs.length ? idxs[0] : -1;
+  }
+  const lc = s => String(s == null ? '' : s).replace(/\s+/g, '').toLowerCase();
+  const isMonthCol = h => /^月份/.test(h || '');
+  /** 条件：包含/等于/不包含（不分大小写）、日期在…之间；表里没有这一列的条件不作用在这张表上 */
+  function rowPass(t, r, conds) {
+    for (const f of conds || []) {
+      if (!f || !f.col) continue;
+      const i = t.headers.indexOf(f.col);
+      if (i < 0) continue;
+      const v = r[i];
+      if (f.op === 'between') {
+        const d = parseDate(v) || (/^\d{4}-\d{2}$/.test(v) ? v + '-01' : '');
+        if (!d) return false;
+        if (f.from && d < f.from) return false;
+        if (f.to && d > f.to) return false;
+        continue;
+      }
+      const a = lc(v), b = lc(f.value);
+      if (!b) continue;
+      if (f.op === 'eq' ? a !== b : f.op === 'not' ? a.includes(b) : !a.includes(b)) return false;
+    }
+    return true;
+  }
+  const activeConds = cs => (cs || []).filter(f => f && f.col && (f.op === 'between' ? (f.from || f.to) : String(f.value || '').trim()));
+
+  /** 已抓明细表（附加虚拟列：顾问、所属小组、日期、月份、月份(某日期列)） */
   function rawTables(roster) {
     const ro = new Map((roster || []).map(r => [norm(r.name), r]));
     return Object.values(getRaw()).map(t => {
       let headers = t.headers.slice(), rows = t.rows;
+      const base = t.headers;
       const ni = t.nameHeader ? headers.indexOf(t.nameHeader) : -1;
       const add = [];
       if (ni >= 0 && !headers.includes('顾问')) add.push(['顾问', r => r[ni]]);
       if (ni >= 0 && !headers.includes('所属小组')) add.push(['所属小组', r => { const x = ro.get(norm(r[ni])); return (x && x.group) || ''; }]);
+      const dc = detectDateCols(base, t.rows);
+      for (const d of dc) add.push([`月份(${base[d]})`, r => ymOf(r[d])]);
+      const pd = primaryDate(base, dc);
+      if (pd >= 0) { add.push(['日期', r => parseDate(r[pd])]); add.push(['月份', r => ymOf(r[pd])]); }
       if (add.length) { headers = headers.concat(add.map(a => a[0])); rows = rows.map(r => r.concat(add.map(a => a[1](r)))); }
-      return { name: t.name, pageKey: t.pageKey, headers, rows, time: t.time };
+      return { name: t.name, pageKey: t.pageKey, headers, rows, time: t.time, dateCol: pd >= 0 ? base[pd] : '', dateCols: dc.map(i => base[i]).concat(pd >= 0 ? ['日期'] : []), range: t.range || '' };
     });
   }
   function knownHeaders() {
@@ -630,27 +682,39 @@
     const gb = (tpl.groupBy || []).filter(Boolean);
     if (!gb.length) throw new Error('这个报表还没选分组字段');
     const metrics = (tpl.metrics || []).filter(m => m.src && m.label);
-    const calcs = (tpl.calcs || []).filter(c => c.label && (c.formula || c.share));
+    const calcs = (tpl.calcs || []).filter(c => c.label && (c.formula || c.share || c.delta));
     const labels = metrics.map(m => m.label).concat(calcs.map(c => c.label));
+    const deltas = calcs.filter(c => c.delta);
     const warn = [];
+    const conds = activeConds(tpl.filters);
+    const missCond = new Set();
     const plan = metrics.map(m => {
       const ts = tables.filter(t => (m.src === '__rows' || t.headers.includes(m.src)) && gb.every(g => t.headers.includes(g)) && (!m.table || t.pageKey === m.table || !tables.some(x => x.pageKey === m.table)));
       if (!ts.length) warn.push(`「${m.label}」：还没有同时带「${m.src}」和「${gb.join('、')}」的已抓表`);
-      return { m, ts: ts.map(t => ({ t, si: m.src === '__rows' ? -1 : t.headers.indexOf(m.src), gi: gb.map(g => t.headers.indexOf(g)) })) };
+      return {
+        m, ts: ts.map(t => {
+          conds.filter(f => !t.headers.includes(f.col)).forEach(f => missCond.add(`「${t.name}」没有「${f.col}」列，这个条件没用在它上面`));
+          const rows = t.rows.filter(r => rowPass(t, r, conds) && rowPass(t, r, activeConds(m.where)));
+          return { t, rows, si: m.src === '__rows' ? -1 : t.headers.indexOf(m.src), gi: gb.map(g => t.headers.indexOf(g)) };
+        })
+      };
     });
-    const formulas = calcs.map(c => {
+    missCond.forEach(w => warn.push(w));
+    const formulas = calcs.filter(c => !c.delta).map(c => {
       if (c.share) return { c, f: (o, tot) => (tot && tot[c.share] ? o[c.share] / tot[c.share] : 0) };
       try { return { c, f: compileFormula(c.formula, labels.filter(l => l !== c.label)) }; } catch (e) { warn.push(`计算列「${c.label}」：${e.message}`); return { c, f: () => 0 }; }
     });
     let remap = null;
-    const build = depth => {
+    const ALL = gb.map((_, i) => i);
+    const empty = j => (gb[j] === '所属小组' ? '未分组' : '（空）');
+    const build = idxs => {
       const groups = new Map();
-      for (const { m, ts } of plan) for (const { t, si, gi } of ts) for (const r of t.rows) {
-        const kv = gi.slice(0, depth).map((i, j) => r[i] || (gb[j] === '所属小组' ? '未分组' : '（空）'));
-        if (remap && kv.length) kv[0] = remap(kv[0]);
+      for (const { m, ts } of plan) for (const { rows, si, gi } of ts) for (const r of rows) {
+        const kv = idxs.map(j => r[gi[j]] || empty(j));
+        if (remap && idxs[0] === 0) kv[0] = remap(kv[0]);
         const k = kv.join('\u0001');
         let g = groups.get(k);
-        if (!g) { g = { kv, vals: {} }; groups.set(k, g); }
+        if (!g) { g = { kv, idxs, vals: {} }; groups.set(k, g); }
         (g.vals[m.label] = g.vals[m.label] || []).push(si < 0 ? 1 : r[si]);
       }
       return [...groups.values()];
@@ -668,47 +732,110 @@
       if (m.agg === 'min') return ns.reduce((a, b) => Math.min(a, b));
       return 0;
     };
+    let TOT = null;
     const finish = g => {
       const o = {};
-      gb.forEach((h, i) => { o[h] = g.kv[i] != null ? g.kv[i] : ''; });
+      gb.forEach(h => { o[h] = ''; });
+      g.idxs.forEach((j, n) => { o[gb[j]] = g.kv[n]; });
       for (const m of metrics) o[m.label] = agg(m, g.vals[m.label]);
       for (const { c, f } of formulas) o[c.label] = f(o, TOT);
+      for (const c of deltas) o[c.label] = '';
       return o;
     };
-    let TOT = null;
-    { const t0 = build(0)[0]; if (t0) { TOT = finish(t0); for (const c of calcs) if (c.share) TOT[c.label] = TOT[c.share] ? 1 : 0; } }
+    { const t0 = build([])[0]; if (t0) { TOT = finish(t0); for (const c of calcs) if (c.share) TOT[c.label] = TOT[c.share] ? 1 : 0; } }
     const sc = tpl.sort && tpl.sort.col, dir = tpl.sort && tpl.sort.dir === 'asc' ? 1 : -1;
-    const cmp = (a, b) => {
-      if (!sc) return 0;
-      const x = a[sc], y = b[sc];
-      if (typeof x === 'number' && typeof y === 'number') return (x - y) * dir;
-      return String(x == null ? '' : x).localeCompare(String(y == null ? '' : y), 'zh') * dir;
+    const cmpBy = (col, d) => (a, b) => {
+      if (!col) return 0;
+      const x = a[col], y = b[col];
+      if (typeof x === 'number' && typeof y === 'number') return (x - y) * d;
+      return String(x == null ? '' : x).localeCompare(String(y == null ? '' : y), 'zh') * d;
     };
-    let rows = build(gb.length).map(finish);
-    // 可选：小组/小渠道合并成「其他（合并）」：保留占比 ≥1% 且前 15 名
+    const cmp = cmpBy(sc, dir);
+    let rows = build(ALL).map(finish);
     if (tpl.mergeSmall && gb.length === 1 && rows.length > 1) {
       const key = sc && typeof rows[0][sc] === 'number' ? sc : (metrics[0] && metrics[0].label);
       const tot = TOT ? TOT[key] : 0;
       const ranked = rows.slice().sort((a, b) => b[key] - a[key]);
       const keep = new Set(ranked.filter((r, i) => i < 15 && (!tot || r[key] / tot >= 0.01)).map(r => r[gb[0]]));
-      if (keep.size < rows.length) { remap = v => (keep.has(v) ? v : '其他（合并）'); rows = build(1).map(finish); }
+      if (keep.size < rows.length) { remap = v => (keep.has(v) ? v : '其他（合并）'); rows = build(ALL).map(finish); }
     }
+    // 环比浮动：同一组内按月份排，本月 − 上月
+    const mi = gb.findIndex(isMonthCol);
+    if (deltas.length && mi >= 0) {
+      const by = new Map();
+      for (const r of rows) { const k = gb.filter((_, i) => i !== mi).map(h => r[h]).join('\u0001'); if (!by.has(k)) by.set(k, []); by.get(k).push(r); }
+      for (const list of by.values()) {
+        list.sort((a, b) => String(a[gb[mi]]).localeCompare(String(b[gb[mi]])));
+        list.forEach((r, i) => { for (const c of deltas) r[c.label] = i && typeof r[c.delta] === 'number' && typeof list[i - 1][c.delta] === 'number' ? r[c.delta] - list[i - 1][c.delta] : ''; });
+      }
+    }
+    const fmt = {};
+    for (const m of metrics) fmt[m.label] = m.fmt || defFmt(m.agg);
+    for (const c of calcs) if (!c.delta) fmt[c.label] = c.fmt || (c.share || /\//.test(c.formula) ? 'pct' : 'money');
+    for (const c of deltas) fmt[c.label] = fmt[c.delta] === 'pct' ? 'pctd' : 'deltan';
+
+    // 月份横向展开
+    const pc = tpl.pivot && tpl.pivot.col;
+    if (pc && gb.includes(pc) && gb.length >= 2) {
+      const pi = gb.indexOf(pc);
+      const rIdx = ALL.filter(i => i !== pi), rowGb = rIdx.map(i => gb[i]);
+      const pvs = [...new Set(rows.map(r => r[pc]))].sort();
+      const vl = (tpl.pivot.metrics && tpl.pivot.metrics.length ? tpl.pivot.metrics : labels.filter(l => !deltas.some(c => c.label === l))).filter(l => labels.includes(l));
+      const sameYear = new Set(pvs.map(p => p.slice(0, 4))).size <= 1;
+      const pvName = p => (/^\d{4}-\d{2}$/.test(p) ? (sameYear ? `${+p.slice(5)}月` : `${p.slice(2, 4)}年${+p.slice(5)}月`) : p);
+      const colName = (L, p) => (vl.length === 1 ? pvName(p) : `${L}·${pvName(p)}`);
+      const totName = L => (vl.length === 1 ? '合计' : `${L}·合计`);
+      const key = o => rowGb.map(h => o[h]).join('\u0001');
+      const rowTot = new Map(build(rIdx).map(g => { const o = finish(g); return [key(o), o]; }));
+      const out = new Map();
+      const blank = o => { for (const L of vl) { for (const p of pvs) o[colName(L, p)] = 0; o[totName(L)] = 0; } };
+      for (const r of rows) {
+        const k = key(r);
+        let o = out.get(k);
+        if (!o) { o = {}; rowGb.forEach(h => { o[h] = r[h]; }); blank(o); out.set(k, o); }
+        for (const L of vl) o[colName(L, r[pc])] = r[L];
+      }
+      for (const [k, o] of out) { const t = rowTot.get(k); if (t) for (const L of vl) o[totName(L)] = t[L]; }
+      const cols = rowGb.slice();
+      const pfmt = {};
+      for (const L of vl) { for (const p of pvs) { cols.push(colName(L, p)); pfmt[colName(L, p)] = fmt[L]; } cols.push(totName(L)); pfmt[totName(L)] = fmt[L]; }
+      const dcol = [];
+      const L0 = vl[0];
+      const withDelta = o => {
+        if (tpl.pivot.delta && pvs.length >= 2 && L0) o['浮动'] = (o[colName(L0, pvs[pvs.length - 1])] || 0) - (o[colName(L0, pvs[pvs.length - 2])] || 0);
+      };
+      if (tpl.pivot.delta && pvs.length >= 2 && L0) { cols.push('浮动'); pfmt['浮动'] = fmt[L0] === 'pct' ? 'pctd' : 'deltan'; dcol.push('浮动'); }
+      let prow = [...out.values()];
+      prow.forEach(withDelta);
+      const sortCol = sc && vl.includes(sc) ? totName(sc) : sc && cols.includes(sc) ? sc : totName(L0);
+      prow.sort(cmpBy(sortCol, sc ? dir : -1));
+      const sums = [];
+      if (tpl.total !== false && prow.length && TOT) {
+        const o = { __sum: true };
+        rowGb.forEach(h => { o[h] = ''; }); o[rowGb[0]] = '合计';
+        blank(o);
+        for (const g of build([pi])) { const f = finish(g); for (const L of vl) o[colName(L, f[pc])] = f[L]; }
+        for (const L of vl) o[totName(L)] = TOT[L];
+        withDelta(o);
+        sums.push(o);
+      }
+      return { cols, rows: prow, sums, warn, fmt: pfmt, groupCols: rowGb, calcLabels: [], deltaCols: dcol };
+    }
+
     let subs = [];
     if (gb.length > 1) {
-      const sub = new Map(build(1).map(g => [g.kv[0], finish(g)]));
+      const sub = new Map(build([0]).map(g => [g.kv[0], finish(g)]));
       subs = [...sub.values()].sort(cmp);
       const order = new Map(subs.map((s, i) => [s[gb[0]], i]));
-      rows.sort((a, b) => (order.get(a[gb[0]]) - order.get(b[gb[0]])) || cmp(a, b));
+      const inner = isMonthCol(gb[1]) ? cmpBy(gb[1], 1) : cmp;
+      rows.sort((a, b) => (order.get(a[gb[0]]) - order.get(b[gb[0]])) || inner(a, b));
     } else rows.sort(cmp);
     const sums = [];
     if (tpl.total !== false && rows.length) {
       for (const s of subs) sums.push(Object.assign({}, s, { __sum: true, [gb[0]]: s[gb[0]] + ' 小计', [gb[1]]: '' }));
       if (TOT) { const o = Object.assign({}, TOT); o[gb[0]] = '合计'; gb.slice(1).forEach(h => { o[h] = ''; }); o.__sum = true; sums.push(o); }
     }
-    const fmt = {};
-    for (const m of metrics) fmt[m.label] = m.fmt || defFmt(m.agg);
-    for (const c of calcs) fmt[c.label] = c.fmt || (c.share || /\//.test(c.formula) ? 'pct' : 'money');
-    return { cols: gb.concat(labels), rows, sums, warn, fmt, groupCols: gb, calcLabels: calcs.map(c => c.label) };
+    return { cols: gb.concat(labels), rows, sums, warn, fmt, groupCols: gb, calcLabels: calcs.filter(c => !c.delta).map(c => c.label), deltaCols: deltas.map(c => c.label) };
   }
 
   // ---------------- 排行 ----------------
@@ -863,10 +990,12 @@
     if (v == null || v === '') return '';
     if (typeof v !== 'number') return String(v);
     if (f === 'pct') return (v * 100).toFixed(1) + '%';
+    if (f === 'pctd') return (v > 0 ? '+' : '') + (v * 100).toFixed(1) + '%';
+    if (f === 'deltan') return (v > 0 ? '+' : '') + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     if (f === 'int') return Math.round(v).toLocaleString('en-US');
     return v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
-  const XF = { money: '#,##0.00', int: '#,##0', pct: '0.0%' };
+  const XF = { money: '#,##0.00', int: '#,##0', pct: '0.0%', pctd: '+0.0%;-0.0%;0.0%', deltan: '+#,##0.00;-#,##0.00;0' };
   function templateView(tpl) {
     const r = computeTemplate(tpl, rawTables(getRoster()));
     const red = tpl.red && tpl.red.col && r.cols.includes(tpl.red.col) ? tpl.red : null;
@@ -878,7 +1007,8 @@
     const sheet = {
       sheet: safe, title: tpl.name || '自定义报表', info, cols: r.cols, rows: r.rows, sums: r.sums,
       numFmt: c => XF[r.fmt[c]] || '@', text, green: c => r.groupCols.includes(c) || r.calcLabels.includes(c),
-      red: (c, row) => !!red && c === red.col && !row.__sum && typeof row[c] === 'number' && row[c] < cut - 1e-12,
+      red: (c, row) => (r.deltaCols.includes(c) ? typeof row[c] === 'number' && row[c] < -1e-12 : !!red && c === red.col && !row.__sum && typeof row[c] === 'number' && row[c] < cut - 1e-12),
+      up: (c, row) => r.deltaCols.includes(c) && typeof row[c] === 'number' && row[c] > 1e-12,
       width: c => autoWidth(c, all, text), freezeCols: r.groupCols.length
     };
     return { kind: 'tpl', name: tpl.name, file: `OCQ_${safe}_${stamp()}`, sheets: [sheet], warn: r.warn };
@@ -925,8 +1055,8 @@
           cell.value = val == null ? '' : val;
           if (typeof val === 'number') cell.numFmt = fmts[j];
           cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: isSum ? C.sum : v.green(c) ? C.green : C.yellow } };
-          const red = v.red(c, r);
-          cell.font = { name: 'Microsoft YaHei', size: 11, bold: isSum || red, color: { argb: red ? C.red : 'FF222222' } };
+          const red = v.red(c, r), up = !red && !!(v.up && v.up(c, r));
+          cell.font = { name: 'Microsoft YaHei', size: 11, bold: isSum || red || up, color: { argb: red ? C.red : up ? 'FF18794E' : 'FF222222' } };
           cell.alignment = { horizontal: 'center', vertical: 'middle' };
           cell.border = box;
         });
@@ -975,8 +1105,8 @@
           g.fillStyle = head ? '#3b3b3b' : sum ? '#f2f2f2' : v.green(c) ? '#eaf5ea' : '#fffbd6';
           g.fillRect(x0, y, widths[ci], H);
           g.strokeStyle = '#bbbbbb'; g.strokeRect(x0 + 0.5, y + 0.5, widths[ci], H);
-          const red = !head && v.red(c, r);
-          g.fillStyle = head ? '#fff' : red ? '#c00000' : '#222';
+          const red = !head && v.red(c, r), up = !head && !red && !!(v.up && v.up(c, r));
+          g.fillStyle = head ? '#fff' : red ? '#c00000' : up ? '#18794e' : '#222';
           g.font = `${head || red || sum ? 'bold ' : ''}13px "Microsoft YaHei", sans-serif`;
           g.fillText(head ? c : v.text(c, r[c]), x0 + widths[ci] / 2, y + H / 2);
           x0 += widths[ci];
@@ -1173,7 +1303,7 @@
   .ok{color:#18794e}.warn{color:#a15c00;font-size:12px}
   .rk{font-size:12px;margin-bottom:10px}.rk th{background:#3b3b3b;color:#fff;padding:4px 6px;border:1px solid #888;white-space:nowrap}
   .rk td{border:1px solid #ccc;padding:4px 6px;text-align:center;background:#fffbd6;white-space:nowrap}
-  .rk td.g{background:#eaf5ea}.rk td.s{background:#f2f2f2;font-weight:bold}.rk td.red{color:#c00000;font-weight:bold}
+  .rk td.g{background:#eaf5ea}.rk td.s{background:#f2f2f2;font-weight:bold}.rk td.red{color:#c00000;font-weight:bold}.rk td.up{color:#18794e;font-weight:bold}
   .rk caption{text-align:left;font-weight:bold;padding:4px 0}
   .rkwrap{overflow:auto;max-height:420px}
   .more{display:inline-block;margin-top:8px;color:#888;font-size:12px;text-decoration:none}
@@ -1186,7 +1316,7 @@
   .wbig{font-size:15px;padding:9px 18px}.wnav{display:flex;align-items:center;gap:6px;margin-top:12px}.wnav .sp{flex:1}
   .wsteps{display:flex;align-items:center;gap:4px;margin-bottom:6px}.wsteps span{width:22px;height:22px;border-radius:50%;background:#eee;color:#888;display:inline-flex;align-items:center;justify-content:center;font-size:12px}
   .wsteps span.cur{background:#ff6a00;color:#fff}.wsteps span.done{background:#ffd9bf;color:#c55a00}.wsteps i{width:24px;height:2px;background:#eee}
-  .adv{margin-top:10px}.sec{margin:6px 0}
+  .adv{margin-top:10px}.chip.sm{padding:3px 8px;font-size:12px}.fr{margin:4px 0;padding:4px 0;border-bottom:1px dashed #eee}.sec{margin:6px 0}
   textarea{width:100%;font-size:12px}
   </style>
   <button class="fab" id="fab" title="OCQ取数">OCQ</button>
@@ -1199,11 +1329,13 @@
         <button class="btn" id="xlsx">📥 导出Excel</button>
         <button class="btn" id="img">🖼 复制图片</button>
       </div>
-      <div id="grabBar" style="display:none"><button class="btn grab" id="go">抓当前这张表</button><div class="muted" id="tblinfo"></div></div>
+      <div id="grabBar" style="display:none"><button class="btn grab" id="go">抓当前这张表</button><div class="muted"><label><input type="checkbox" id="addStep"> 加入每日取数步骤</label>　<span id="tblinfo"></span></div></div>
       <div class="prog" id="prog"></div>
       <div class="editor" id="newBox" style="display:none">
         <div class="wq">快速报表 <span class="muted">点一下就出</span><button class="mini" id="newClose" style="float:right">×</button></div>
         <div class="chips" id="presetBtns"></div>
+        <div class="wq" style="font-size:14px;margin-top:10px">Facebook 分析　<span class="muted">月份</span> <input type="month" id="pFrom"> ~ <input type="month" id="pTo"></div>
+        <div class="chips" id="fbBtns"></div><div class="warn" id="newMsg"></div>
         <button class="btn p wbig" id="ownBtn" style="margin-top:8px">＋ 自己建一个</button>
       </div>
       <div class="editor" id="wiz" style="display:none"><div id="wizBody"></div></div>
@@ -1246,7 +1378,7 @@
   document.documentElement.appendChild(host);
   const $ = id => root.getElementById(id);
 
-  let scan = null, busy = false, ed = null;
+  let scan = null, busy = false, ed = null, scanRange = { hist: false, tag: '' };
   const targetOpts = sel => STD.map(f => `<option value="${f}" ${sel === f ? 'selected' : ''}>${f.replace('(元)', '')}</option>`).join('') + `<option value="__custom" ${sel === '__custom' ? 'selected' : ''}>自定义…</option>`;
   const tm = ms => { const d = new Date(ms + 8 * 3600e3); return `${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')} ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`; };
 
@@ -1265,17 +1397,38 @@
     setPrefs(p);
     root.querySelectorAll('#cols tr[data-key]').forEach(tr => { tr.querySelector('.custom').style.display = tr.querySelector('.target').value === '__custom' ? '' : 'none'; });
   }
+  /** 这页筛的是哪段时间：先看页面上的日期框/网址，再看表里的日期列 */
+  function pageRange(parsed) {
+    let ds = [...String(location.href).matchAll(/(\d{4})-(\d{2})-(\d{2})/g)].map(m => m[0]);
+    document.querySelectorAll('input').forEach(i => { const d = parseDate(i.value); if (d && visible(i)) ds.push(d); });
+    let src = 'filter';
+    if (!ds.length && parsed) {
+      src = 'data';
+      const dc = detectDateCols(parsed.headers, parsed.rows);
+      const pd = primaryDate(parsed.headers, dc);
+      if (pd >= 0) ds = parsed.rows.map(r => parseDate(r[pd])).filter(Boolean);
+    }
+    if (!ds.length) return { hist: false, tag: '' };
+    ds.sort();
+    const from = ds[0], to = ds[ds.length - 1], t = today8(), cur = `${t.y}-${p2(t.m)}`;
+    const hist = !(from.slice(0, 7) === cur && to.slice(0, 7) === cur);
+    const a = from.slice(0, 7), b = to.slice(0, 7);
+    const tag = a === b ? a : a.slice(0, 4) === b.slice(0, 4) ? `${a}~${b.slice(5)}` : `${a}~${b}`;
+    return { hist, tag, from, to, src };
+  }
   function doScan() {
     const t = findBestTable();
     if (!t) { $('grabBar').style.display = 'none'; $('pickBox').style.display = 'none'; scan = null; return; }
     $('grabBar').style.display = ''; $('pickBox').style.display = '';
+    scanRange = pageRange(t.parsed);
+    $('addStep').checked = !scanRange.hist;
     const a = analyze(t.parsed);
     scan = Object.assign({ parsed: t.parsed }, a);
     const saved = getPrefs()[pageKey()];
     let nameIdx = a.nameIdx;
     if (saved && saved.nameKey) { const c = a.cols.find(c => c.key === saved.nameKey); if (c) nameIdx = c.idx; }
     const tot = parseTotal();
-    $('tblinfo').textContent = `这页「${pageKey()}」` + (tot != null ? `共 ${tot} 条` : `${t.parsed.rows.length} 行`) + (getSteps().some(s => s.pageKey === pageKey()) ? ' · 已在取数步骤里' : '');
+    $('tblinfo').textContent = `这页「${pageKey()}」` + (tot != null ? `共 ${tot} 条` : `${t.parsed.rows.length} 行`) + (getSteps().some(s => s.pageKey === pageKey()) ? ' · 已在取数步骤里' : '') + (scanRange.hist ? ` · 是 ${scanRange.tag} 的数据（存成历史数据）` : '');
     const shown = a.cols.filter(c => !/^__sel/.test(c.header));
     $('namecol').innerHTML = `<option value="-1">（没有）</option>` + shown.map(c => `<option value="${c.idx}" ${c.idx === nameIdx ? 'selected' : ''}>${esc(c.display)}</option>`).join('');
     if (nameIdx < 0) $('namecol').value = '-1';
@@ -1301,6 +1454,8 @@
     const st = getSteps();
     $('stepCnt').textContent = st.length ? `（${st.length} 步）` : '';
     $('steps').innerHTML = st.length ? st.map((s, i) => { const n = stepCount(s); return `<div data-i="${i}"><span class="nm" title="${esc(s.url)}">${esc(s.name)}<span class="muted">${n != null ? ` · ${n} 条` : ' · 还没抓'}</span></span><button class="mini" data-a="del" title="删除这一步">×</button></div>`; }).join('') : '<span class="muted">（还没有：打开一张明细表，点「抓当前这张表」）</span>';
+    const hist = Object.values(getRaw()).filter(r => r.range && !st.some(s => s.pageKey === r.pageKey));
+    if (hist.length) $('steps').innerHTML += '<div class="muted" style="border:none">历史数据（不参加每日取数）：</div>' + hist.map(r => `<div data-raw="${esc(r.pageKey)}"><span class="nm">${esc(r.pageKey)}<span class="muted"> · ${r.rows.length} 条</span></span><button class="mini" data-a="rmraw" title="删除这份历史数据">×</button></div>`).join('');
   }
   function renderSources() {
     const ss = getSources();
@@ -1333,7 +1488,7 @@
     $('rinfo').innerHTML = esc(v.sheets[0].info).replace(/时间进度 ([\d.]+%)/, '时间进度 <b>$1</b>');
     $('warn').textContent = (v.warn || []).join('；');
     $('rkwrap').innerHTML = v.sheets.map((s, si) => `<table class="rk">${v.sheets.length > 1 || si ? `<caption>${esc(s.title)}</caption>` : ''}<tr>${s.cols.map(c => `<th>${esc(c)}</th>`).join('')}</tr>` +
-      (s.rows.length ? s.rows.concat(s.sums).map(r => `<tr>${s.cols.map(c => `<td class="${r.__sum ? 's' : s.green(c) ? 'g' : ''} ${s.red(c, r) ? 'red' : ''}">${esc(s.text(c, r[c]))}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${s.cols.length}" class="muted">（还没有数据）</td></tr>`) + '</table>').join('');
+      (s.rows.length ? s.rows.concat(s.sums).map(r => `<tr>${s.cols.map(c => `<td class="${r.__sum ? 's' : s.green(c) ? 'g' : ''} ${s.red(c, r) ? 'red' : s.up && s.up(c, r) ? 'up' : ''}">${esc(s.text(c, r[c]))}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${s.cols.length}" class="muted">（还没有数据）</td></tr>`) + '</table>').join('');
     $('log').textContent = getLog().slice().reverse().join('\n');
     return v;
   }
@@ -1362,7 +1517,7 @@
       const cols = t.headers.map((h, i) => {
         const vals = t.rows.map(r => r[i]).filter(v => String(v || '').trim());
         const nums = vals.filter(v => num(v) != null).length;
-        const numeric = vals.length > 0 && nums / vals.length >= 0.8 && !/电话|手机|编号|单号|日期|时间|ID|id/.test(h);
+        const numeric = vals.length > 0 && nums / vals.length >= 0.8 && !/电话|手机|编号|单号|日期|时间|月份|ID|id|^#$|^序号$/.test(h);
         return { h, numeric, money: numeric && isMoneyName(h), example: vals[0] || '', filled: vals.length, distinct: new Set(vals).size };
       }).filter(c => c.filled && !(c.h === '所属小组' && !hasGroups && !t.headers.slice(0, -2).includes('所属小组')));
       return { t, cols };
@@ -1402,12 +1557,80 @@
     hideBoxes(); renderAll();
     return t;
   }
+  // ---------- FB 报表（带日期范围） ----------
+  const p2 = n => String(n).padStart(2, '0');
+  function lastFullMonths(n) {
+    const t = today8();
+    let y = t.y, m = t.m - 1;
+    if (m < 1) { m = 12; y--; }
+    const toM = `${y}-${p2(m)}`;
+    let fy = y, fm = m - (n - 1);
+    while (fm < 1) { fm += 12; fy--; }
+    return { from: `${fy}-${p2(fm)}`, to: toM };
+  }
+  const monthEnd = ym => { const [y, m] = ym.split('-').map(Number); return `${ym}-${p2(new Date(Date.UTC(y, m, 0)).getUTCDate())}`; };
+  const chanCol = p => p.t.headers.find(h => /渠道/.test(h) && !/^月份/.test(h)) || '';
+  const isOrderTab = p => p.t.headers.includes('成交金额');
+  const isValidTab = p => !isOrderTab(p) && /有效/.test(p.t.name) && !/无效/.test(p.t.name);
+  const validityCol = p => p.t.headers.find(h => /是否有效|有效性|判定结果|线索状态|客资状态|有效状态/.test(h)) || '';
+  const isLeadTab = p => !isOrderTab(p) && !isValidTab(p) && !/无效/.test(p.t.name) && (/线索|客资/.test(p.t.name) || !!validityCol(p));
+  const houseCol = p => p.t.headers.find(h => /房子|房屋/.test(h) && !/^月份/.test(h)) || '';
+  function fbRoles(fromYM, toYM) {
+    const from = fromYM + '-01', to = monthEnd(toYM);
+    const prof = colProfile();
+    const ok = p => chanCol(p) && p.t.headers.includes('日期') && p.t.headers.includes('顾问');
+    const score = p => { const i = p.t.headers.indexOf('日期'); return p.t.rows.filter(r => r[i] && r[i] >= from && r[i] <= to).length; };
+    const best = f => prof.filter(p => ok(p) && f(p)).sort((a, b) => score(b) - score(a) || b.t.time - a.t.time)[0] || null;
+    return { from, to, order: best(isOrderTab), lead: best(isLeadTab), valid: best(isValidTab) };
+  }
+  function fbConds(R, tabs) {
+    const cols = [...new Set(tabs.filter(Boolean).map(chanCol).filter(Boolean))];
+    return cols.map(c => ({ col: c, op: 'contains', value: 'facebook' })).concat([{ col: '日期', op: 'between', from: R.from, to: R.to }]);
+  }
+  function fbPresets(fromYM, toYM) {
+    const R = fbRoles(fromYM, toYM), out = [];
+    const rng = `${fromYM}~${toYM}`;
+    if (R.order) {
+      out.push({ key: 'fb1', name: 'FB·每人每月成交', tpl: { name: 'FB·每人每月成交', groupBy: ['顾问', '月份'], filters: fbConds(R, [R.order]), metrics: [{ src: '成交金额', agg: 'sum', label: '成交金额', fmt: 'money', table: R.order.t.pageKey }], calcs: [], pivot: { col: '月份', delta: false }, sort: { col: '成交金额', dir: 'desc' }, red: {}, total: true } });
+      const hc = houseCol(R.order);
+      if (hc) out.push({ key: 'fb2', name: 'FB·房子情况', tpl: { name: 'FB·房子情况', groupBy: [hc], filters: fbConds(R, [R.order]), metrics: [{ src: '__rows', agg: 'rows', label: '单数', fmt: 'int', table: R.order.t.pageKey }, { src: '成交金额', agg: 'sum', label: '成交金额', fmt: 'money', table: R.order.t.pageKey }], calcs: [{ label: '占比', share: '单数', formula: '', fmt: 'pct' }], sort: { col: '单数', dir: 'desc' }, red: {}, total: true } });
+      if (R.lead) {
+        const ms = [{ src: '__rows', agg: 'rows', label: '客资', fmt: 'int', table: R.lead.t.pageKey }];
+        let rate = '成单/客资', rateName = '成单率(按总客资)';
+        if (R.valid) { ms.push({ src: '__rows', agg: 'rows', label: '有效客资', fmt: 'int', table: R.valid.t.pageKey }); rate = '成单/有效客资'; rateName = '有效客资成单率'; }
+        else if (validityCol(R.lead)) { const vc = validityCol(R.lead); ms.push({ src: '__rows', agg: 'rows', label: '有效客资', fmt: 'int', table: R.lead.t.pageKey, where: [{ col: vc, op: 'contains', value: '有效' }, { col: vc, op: 'not', value: '无效' }] }); rate = '成单/有效客资'; rateName = '有效客资成单率'; }
+        ms.push({ src: '__rows', agg: 'rows', label: '成单', fmt: 'int', table: R.order.t.pageKey });
+        out.push({ key: 'fb3', name: 'FB·客资与成单率', tpl: { name: 'FB·客资与成单率', groupBy: ['顾问', '月份'], filters: fbConds(R, [R.order, R.lead, R.valid]), metrics: ms, calcs: [{ label: rateName, formula: rate, fmt: 'pct' }, { label: '浮动', delta: rateName, formula: '', fmt: 'pctd' }], sort: { col: '成单', dir: 'desc' }, red: {}, total: true } });
+      }
+    }
+    const nameOf = pk => (colProfile().find(p => p.t.pageKey === pk) || { t: { name: pk } }).t.name;
+    out.forEach(x => { x.tpl.presetKey = x.key; x.tpl.range = rng; x.tables = [...new Set(x.tpl.metrics.map(m => m.table))].map(nameOf); });
+    return out;
+  }
+  function applyFb(key) {
+    const from = $('pFrom').value, to = $('pTo').value;
+    if (!from || !to || from > to) { $('newMsg').textContent = '请选好起止月份'; return null; }
+    const x = fbPresets(from, to).find(p => p.key === key);
+    if (!x) return null;
+    const old = getTpls().find(t => t.presetKey === key);
+    const t = saveTemplate(Object.assign(x.tpl, { name: `${x.name}（${from.slice(5).replace(/^0/, '')}–${to.slice(5).replace(/^0/, '')}月）` }, old ? { id: old.id } : {}));
+    hideBoxes(); renderAll();
+    return t;
+  }
+  function renderFbBtns() {
+    const from = $('pFrom').value, to = $('pTo').value;
+    const ps = from && to ? fbPresets(from, to) : [];
+    $('fbBtns').innerHTML = ps.length ? ps.map(x => `<button class="btn chip" data-fb="${x.key}">${esc(x.name)}<span class="muted">　${esc(x.tables.join(' + '))}</span></button>`).join('') : '<span class="muted">需要先抓带「渠道来源」和日期的订单表（如 装修项目列表）；客资报表还要抓线索表</span>';
+  }
   function hideBoxes() { $('newBox').style.display = 'none'; $('wiz').style.display = 'none'; ed = null; }
   function openNewBox() {
     hideBoxes();
     $('panel').classList.add('open');
     const ps = availablePresets();
     $('presetBtns').innerHTML = ps.length ? ps.map(x => `<button class="btn chip" data-name="${esc(x.name)}" data-g="${esc(x.g)}">${esc(x.name)}<span class="muted">　${esc(x.p.t.name)}</span></button>`).join('') : '<span class="muted">先「⚡ 一键取数」或抓一张明细表，这里会按抓到的列给出快速报表</span>';
+    if (!$('pFrom').value) { const r = lastFullMonths(3); $('pFrom').value = r.from; $('pTo').value = r.to; }
+    $('newMsg').textContent = '';
+    renderFbBtns();
     $('newBox').style.display = '';
   }
 
@@ -1416,7 +1639,7 @@
   function openWizard(tpl) {
     hideBoxes();
     ed = tpl ? JSON.parse(JSON.stringify(tpl)) : { id: '', name: '', groupBy: [], metrics: [], calcs: [], sort: { col: '', dir: 'desc' }, red: { col: '', mode: 'progress', value: '' }, total: true };
-    ed.groupBy = ed.groupBy || []; ed.metrics = ed.metrics || []; ed.calcs = ed.calcs || []; ed.sort = ed.sort || { dir: 'desc' }; ed.red = ed.red || {};
+    ed.groupBy = ed.groupBy || []; ed.filters = ed.filters || []; ed.metrics = ed.metrics || []; ed.calcs = ed.calcs || []; ed.sort = ed.sort || { dir: 'desc' }; ed.red = ed.red || {};
     ed.__autoName = !tpl;
     wizStep = 1; wizSub = ed.groupBy.length > 1;
     $('panel').classList.add('open');
@@ -1471,6 +1694,7 @@
           h += `<div class="muted" style="margin-top:8px">再细分一层（可不选）<a href="#" class="more" data-w="nosub">　不细分</a></div><div class="chips">${tc2.map(c => chip(c, ed.groupBy[1] === c.h, 'g2')).join('')}</div>`;
         }
       }
+      h += filterHtml(prof);
       if (ed.groupBy[0] && !ed.groupBy[1]) h += `<details class="adv" ${ed.mergeSmall ? 'open' : ''}><summary>高级</summary><label><input type="checkbox" id="wMerge" ${ed.mergeSmall ? 'checked' : ''}> 小渠道合并成其他 <span class="muted">（只留占比 ≥1% 的前 15 个）</span></label></details>`;
       h += nav(false, `<button class="btn p wbig" data-w="next" ${ed.groupBy[0] ? '' : 'disabled'}>下一步 →</button>`);
     } else if (wizStep === 2) {
@@ -1486,29 +1710,67 @@
       });
       h += `<details class="adv" ${ed.metrics.some(m => m.agg !== 'sum' && m.agg !== 'rows') || ed.calcs.some(c => c.formula) ? 'open' : ''}><summary>高级</summary>` +
         (ed.metrics.filter(m => m.src !== '__rows').length ? '<div class="muted">怎么算：</div>' + ed.metrics.filter(m => m.src !== '__rows').map(m => `<div class="er">${esc(baseLabel(m))} <select data-agg="${esc(m.table + '\u0001' + m.src)}">${objOpt({ sum: '求和', avg: '平均', max: '最大', min: '最小', distinct: '去重计数' }, m.agg)}</select></div>`).join('') : '') +
+        '<div class="muted" style="margin-top:6px">改名（公式里好用，如 成单、有效客资）：</div>' + ed.metrics.map(m => `<div class="er"><span class="muted" style="width:150px">${esc(m.label)}</span> → <input type="text" class="m-name" data-mk="${esc(m.table + '\u0001' + m.src)}" value="${esc(m.label)}" style="width:110px"></div>`).join('') +
         `<div class="muted" style="margin-top:6px">计算列：用上面的名字和 + - * /。例：单均 = ${esc((ed.metrics.find(m => m.src !== '__rows') || { label: '变动金额' }).label)} / 单数</div>` +
-        ed.calcs.map((c, i) => c.share ? `<div class="er" data-i="${i}">${esc(c.label)} = ${esc(c.share)} ÷ 合计 <button class="mini" data-w="rmC">×</button></div>` : `<div class="er" data-i="${i}"><input type="text" class="c-label" value="${esc(c.label)}" placeholder="名字" style="width:80px"> = <input type="text" class="c-formula" value="${esc(c.formula)}" placeholder="如 变动金额/单数" style="flex:1"><button class="mini" data-w="rmC">×</button></div>`).join('') +
-        `<button class="mini" data-w="addC">＋ 计算列</button> <button class="mini" data-w="addShare">＋ 占比（单数÷合计）</button><div class="warn" id="wMsg"></div></details>`;
+        ed.calcs.map((c, i) => c.delta ? `<div class="er" data-i="${i}">${esc(c.label)} = ${esc(c.delta)} 本月 − 上月 <button class="mini" data-w="rmC">×</button></div>` : c.share ? `<div class="er" data-i="${i}">${esc(c.label)} = ${esc(c.share)} ÷ 合计 <button class="mini" data-w="rmC">×</button></div>` : `<div class="er" data-i="${i}"><input type="text" class="c-label" value="${esc(c.label)}" placeholder="名字" style="width:80px"> = <input type="text" class="c-formula" value="${esc(c.formula)}" placeholder="如 变动金额/单数" style="flex:1"><button class="mini" data-w="rmC">×</button></div>`).join('') +
+        `<button class="mini" data-w="addC">＋ 计算列</button> <button class="mini" data-w="addShare">＋ 占比（单数÷合计）</button>${ed.groupBy.some(isMonthCol) ? ' <button class="mini" data-w="addDelta">＋ 环比浮动（本月−上月）</button>' : ''}<div class="muted">例：有效客资成单率 = 成单 / 有效客资（会显示成 %）</div><div class="warn" id="wMsg"></div></details>`;
       h += nav(true, `<button class="btn p wbig" data-w="next" ${ed.metrics.length ? '' : 'disabled'}>下一步 →</button>`);
     } else {
       const labs = metricLabels();
       if (!labs.includes(ed.sort.col)) ed.sort.col = labs[0] || '';
       if (ed.__autoName || !ed.name) ed.name = `按${ed.groupBy.join('/')}统计`;
+      if (ed.pivot && !ed.groupBy.some(isMonthCol)) ed.pivot = null;
       h += `<div class="wq">按哪个排名？</div><div class="checks">${labs.map(l => `<label class="ck"><input type="radio" name="wsort" value="${esc(l)}" ${ed.sort.col === l ? 'checked' : ''}> ${esc(l)}</label>`).join('')}</div>` +
         `<div style="margin:6px 0"><label><input type="radio" name="wdir" value="desc" ${ed.sort.dir !== 'asc' ? 'checked' : ''}> 从大到小</label>　<label><input type="radio" name="wdir" value="asc" ${ed.sort.dir === 'asc' ? 'checked' : ''}> 从小到大</label></div>` +
         `<div class="wq" style="font-size:14px">报表名称</div><input type="text" id="wName" value="${esc(ed.name)}" style="width:100%;font-size:15px;padding:6px">` +
         `<details class="adv" ${ed.red.col ? 'open' : ''}><summary>高级</summary>` +
         `<div class="er">标红：<select id="wRedCol">${opt(labs, ed.red.col, '（不标红）')}</select> 低于 <select id="wRedMode">${objOpt({ progress: '时间进度', fixed: '固定值' }, ed.red.mode || 'progress')}</select> <input type="text" id="wRedVal" value="${esc(ed.red.value || '')}" style="width:60px;${ed.red.mode === 'fixed' ? '' : 'display:none'}" placeholder="如 80"></div>` +
-        `<div><label><input type="checkbox" id="wTotal" ${ed.total !== false ? 'checked' : ''}> 最后加合计行</label></div></details>`;
+        `<div><label><input type="checkbox" id="wTotal" ${ed.total !== false ? 'checked' : ''}> 最后加合计行</label></div>` +
+        (ed.groupBy.length >= 2 && ed.groupBy.some(isMonthCol) ? `<div><label><input type="checkbox" id="wPivot" ${ed.pivot ? 'checked' : ''}> 月份横向展开（每月一列 + 合计）</label> <span id="wPivDeltaBox" style="${ed.pivot ? '' : 'display:none'}"><label><input type="checkbox" id="wPivDelta" ${ed.pivot && ed.pivot.delta ? 'checked' : ''}> 加「浮动」列（最后一个月 − 上个月）</label></span></div>` : '') + `</details>`;
       h += nav(true, `<button class="btn p wbig" data-w="done">完成</button>`) + '<div class="warn" id="wMsg"></div>';
     }
     $('wizBody').innerHTML = h;
   }
+  function filterCols(prof) {
+    const set = new Set(), dates = new Set();
+    for (const p of prof) { p.t.headers.forEach(h => { if (!/^月份|^顾问$|^所属小组$/.test(h)) set.add(h); }); (p.t.dateCols || []).forEach(h => dates.add(h)); }
+    return { cols: [...set], dates };
+  }
+  function topValues(prof, col) {
+    const cnt = new Map();
+    for (const p of prof) { const i = p.t.headers.indexOf(col); if (i < 0) continue; for (const r of p.t.rows) { const v = String(r[i] || '').trim(); if (v) cnt.set(v, (cnt.get(v) || 0) + 1); } }
+    return [...cnt.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(x => x[0]);
+  }
+  function filterHtml(prof) {
+    const fc = filterCols(prof);
+    ed.filters = ed.filters || [];
+    let h = `<div class="wq" style="font-size:14px;margin-top:14px">只看哪些行？ <span class="muted">（可不设；不分大小写，多个条件要同时满足）</span></div>`;
+    h += ed.filters.map((f, i) => {
+      const isD = fc.dates.has(f.col);
+      const vals = f.col && !isD ? topValues(prof, f.col) : [];
+      return `<div class="fr" data-f="${i}"><div class="er"><select class="f-col">${opt(fc.cols, f.col, '（选一列）')}</select>` +
+        (isD ? ` 在 <input type="date" class="f-from" value="${esc(f.from || '')}"> ~ <input type="date" class="f-to" value="${esc(f.to || '')}"> 之间`
+          : ` <select class="f-op">${objOpt({ contains: '包含', eq: '等于', not: '不包含' }, f.op || 'contains')}</select> <input type="text" class="f-val" value="${esc(f.value || '')}" placeholder="如 facebook" style="width:120px">`) +
+        ` <button class="mini" data-w="rmF">×</button></div>` +
+        (vals.length ? `<div class="chips">${vals.map(v => `<button class="btn chip sm" data-w="fv" data-v="${esc(v)}">${esc(v.slice(0, 18))}</button>`).join('')}</div>` : '') + '</div>';
+    }).join('');
+    return h + `<a href="#" class="more" data-w="addF">＋ 加条件</a>`;
+  }
+  function readFilters() {
+    const fc = filterCols(colProfile());
+    ed.filters = [...$('wizBody').querySelectorAll('.fr')].map(r => {
+      const col = r.querySelector('.f-col').value;
+      if (fc.dates.has(col)) return { col, op: 'between', from: (r.querySelector('.f-from') || {}).value || '', to: (r.querySelector('.f-to') || {}).value || '' };
+      return { col, op: (r.querySelector('.f-op') || {}).value || 'contains', value: ((r.querySelector('.f-val') || {}).value || '').trim() };
+    });
+  }
   function readWizard() {
     const q = s => $('wizBody').querySelector(s);
+    if (wizStep === 1 && q('.fr,[data-w=addF]')) readFilters();
     if (wizStep === 2) {
+      root.querySelectorAll('#wizBody .m-name').forEach(inp => { const [pk, src] = inp.dataset.mk.split('\u0001'); const m = ed.metrics.find(x => x.table === pk && x.src === src); const v = inp.value.trim(); if (m && v && v !== m.label) { ed.calcs.forEach(c => { if (c.delta === m.label) c.delta = v; if (c.share === m.label) c.share = v; }); m.label = v; m.__named = true; } });
       ed.calcs = ed.calcs.map((c, i) => {
-        if (c.share) return c;
+        if (c.share || c.delta) return c;
         const r = $('wizBody').querySelector(`.er[data-i="${i}"]`);
         return r ? { label: r.querySelector('.c-label').value.trim(), formula: r.querySelector('.c-formula').value.trim(), fmt: '' } : c;
       });
@@ -1519,6 +1781,8 @@
       const nm = q('#wName').value.trim(); if (nm !== ed.name) { ed.name = nm; ed.__autoName = false; }
       ed.red = { col: q('#wRedCol').value, mode: q('#wRedMode').value, value: q('#wRedVal').value.trim() };
       ed.total = q('#wTotal').checked;
+      const pv = q('#wPivot');
+      ed.pivot = pv && pv.checked ? { col: ed.groupBy.find(isMonthCol), delta: !!(q('#wPivDelta') && q('#wPivDelta').checked) } : null;
     }
   }
   /** 单数要限定在一张表上（不然多张表的行会混在一起数） */
@@ -1529,12 +1793,14 @@
   }
   function finishWizard() {
     readWizard();
-    ed.calcs = ed.calcs.filter(c => c.label && (c.formula || c.share));
+    ed.calcs = ed.calcs.filter(c => c.label && (c.formula || c.share || c.delta));
+    ed.filters = activeConds(ed.filters);
     const err = validateTpl(Object.assign({}, ed, { metrics: ed.metrics.map(m => Object.assign({}, m)) }));
     if (err) { const w = $('wizBody').querySelector('#wMsg'); if (w) w.textContent = err; return null; }
     fixRowsTable();
     for (const m of ed.metrics) m.fmt = fmtForMetric(m);
-    for (const c of ed.calcs) c.fmt = fmtForCalc(c);
+    for (const c of ed.calcs) c.fmt = c.delta ? '' : fmtForCalc(c);
+    for (const m of ed.metrics) delete m.__named;
     const t = Object.assign({}, ed); delete t.__autoName; delete t.preset; delete t.__prim;
     const saved = saveTemplate(t);
     hideBoxes(); renderAll();
@@ -1546,14 +1812,14 @@
     if (!t.metrics.length) return '至少要选一个数';
     const labels = t.metrics.map(m => m.label).concat(t.calcs.filter(c => c.label).map(c => c.label));
     if (new Set(labels).size !== labels.length) return '名字有重复';
-    for (const c of t.calcs.filter(c => !c.share && (c.label || c.formula))) {
+    for (const c of t.calcs.filter(c => !c.share && !c.delta && (c.label || c.formula))) {
       if (!c.label || !c.formula) return '计算列要同时填名字和公式';
       try { compileFormula(c.formula, labels.filter(l => l !== c.label)); } catch (e) { return `计算列「${c.label}」：${e.message}`; }
     }
     return '';
   }
   function saveTemplate(t) {
-    t = Object.assign({}, t, { metrics: (t.metrics || []).filter(m => m.src), calcs: (t.calcs || []).filter(c => c.label && (c.formula || c.share)) });
+    t = Object.assign({}, t, { metrics: (t.metrics || []).filter(m => m.src), calcs: (t.calcs || []).filter(c => c.label && (c.formula || c.share || c.delta)) });
     if (!t.id) t.id = 't' + Date.now() + Math.floor(Math.random() * 1000);
     const tp = getTpls();
     const i = tp.findIndex(x => x.id === t.id);
@@ -1584,7 +1850,7 @@
         }
         if (wizStep === 1 && !ed.metrics.length) ed.metrics = [{ src: '__rows', agg: 'rows', label: '单数', table: ed.__prim }];
         if (wizStep === 2) {
-          ed.calcs = ed.calcs.filter(c => c.share || c.label || c.formula);
+          ed.calcs = ed.calcs.filter(c => c.share || c.delta || c.label || c.formula);
           const err = validateTpl(Object.assign({}, ed, { name: 'x' }));
           if (err) { $('wizBody').querySelector('#wMsg').textContent = err; return; }
         }
@@ -1593,6 +1859,10 @@
       else if (w === 'cancel') { hideBoxes(); renderTplSel(); return; }
       else if (w === 'done') { finishWizard(); return; }
       else if (w === 'addC') ed.calcs.push({ label: '', formula: '' });
+      else if (w === 'addDelta') { const x = (ed.calcs.filter(c => !c.delta && !c.share).slice(-1)[0] || ed.metrics[0] || {}).label; if (x && !ed.calcs.some(c => c.delta === x)) ed.calcs.push({ label: x + '浮动', delta: x, formula: '' }); }
+      else if (w === 'addF') ed.filters.push({ col: '', op: 'contains', value: '' });
+      else if (w === 'rmF') ed.filters.splice(+b.closest('.fr').dataset.f, 1);
+      else if (w === 'fv') { const f = ed.filters[+b.closest('.fr').dataset.f]; f.value = b.dataset.v; if (f.op === 'between') f.op = 'contains'; }
       else if (w === 'addShare') { if (!ed.calcs.some(c => c.share)) ed.calcs.push({ label: '占比', share: '单数', formula: '' }); }
       else if (w === 'rmC') ed.calcs.splice(+b.closest('.er').dataset.i, 1);
     }
@@ -1607,11 +1877,15 @@
       readWizard(); renderWizard();
     } else if (t.dataset.agg != null) {
       const [pk, src] = t.dataset.agg.split('\u0001');
-      const m = ed.metrics.find(x => x.table === pk && x.src === src); m.agg = t.value; m.label = metricLabel(m);
+      const m = ed.metrics.find(x => x.table === pk && x.src === src); m.agg = t.value; if (!m.__named) m.label = metricLabel(m);
       readWizard(); renderWizard();
     } else if (t.id === 'wMerge') { ed.mergeSmall = t.checked; }
+    else if (t.classList.contains('f-col')) { readFilters(); const f = ed.filters[+t.closest('.fr').dataset.f]; f.value = ''; f.from = f.from || ''; renderWizard(); }
+    else if (t.id === 'wPivot') { const d = $('wizBody').querySelector('#wPivDeltaBox'); if (d) d.style.display = t.checked ? '' : 'none'; }
     else if (t.id === 'wRedMode') $('wizBody').querySelector('#wRedVal').style.display = t.value === 'fixed' ? '' : 'none';
   });
+  $('fbBtns').addEventListener('click', e => { const b = e.target.closest('[data-fb]'); if (b) applyFb(b.dataset.fb); });
+  $('pFrom').onchange = renderFbBtns; $('pTo').onchange = renderFbBtns;
   $('presetBtns').addEventListener('click', e => { const b = e.target.closest('[data-g]'); if (b) applyPreset(b.dataset.name, b.dataset.g); });
   $('ownBtn').onclick = () => openWizard(null);
   $('newClose').onclick = () => { hideBoxes(); renderTplSel(); };
@@ -1650,7 +1924,7 @@
     const tp = getTpls(); let n = 0;
     for (const x of arr) {
       if (!x || typeof x !== 'object' || !x.name || !Array.isArray(x.groupBy) || !Array.isArray(x.metrics)) continue;
-      const t = { id: x.id && !tp.some(y => y.id === x.id) ? String(x.id) : 't' + Date.now() + n, name: String(x.name), groupBy: x.groupBy.map(String).slice(0, 2), metrics: x.metrics.map(m => ({ src: String(m.src || ''), agg: AGG_NAMES[m.agg] ? m.agg : 'sum', label: String(m.label || ''), fmt: FMT_NAMES[m.fmt] ? m.fmt : defFmt(m.agg), table: m.table ? String(m.table) : '' })), calcs: (x.calcs || []).map(c => ({ label: String(c.label || ''), formula: String(c.formula || ''), share: c.share ? String(c.share) : '', fmt: FMT_NAMES[c.fmt] ? c.fmt : '' })), preset: !!x.preset, sort: x.sort || {}, red: x.red || {}, total: x.total !== false, mergeSmall: !!x.mergeSmall };
+      const t = { id: x.id && !tp.some(y => y.id === x.id) ? String(x.id) : 't' + Date.now() + n, name: String(x.name), groupBy: x.groupBy.map(String).slice(0, 2), metrics: x.metrics.map(m => ({ src: String(m.src || ''), agg: AGG_NAMES[m.agg] ? m.agg : 'sum', label: String(m.label || ''), fmt: FMT_NAMES[m.fmt] ? m.fmt : defFmt(m.agg), table: m.table ? String(m.table) : '', where: Array.isArray(m.where) ? m.where : undefined })), calcs: (x.calcs || []).map(c => ({ label: String(c.label || ''), formula: String(c.formula || ''), share: c.share ? String(c.share) : '', delta: c.delta ? String(c.delta) : '', fmt: FMT_NAMES[c.fmt] || c.fmt === 'pctd' ? c.fmt : '' })), filters: Array.isArray(x.filters) ? x.filters : [], pivot: x.pivot && x.pivot.col ? { col: String(x.pivot.col), delta: !!x.pivot.delta } : null, presetKey: x.presetKey || '', preset: !!x.preset, sort: x.sort || {}, red: x.red || {}, total: x.total !== false, mergeSmall: !!x.mergeSmall };
       tp.push(t); n++;
     }
     setTpls(tp);
@@ -1698,14 +1972,19 @@
       const res = await scrapeAll((p, n, tot, note) => { $('prog').textContent = note || `正在抓第 ${p} 页（${n}/${tot != null ? tot : '?'}）`; }, nameIdx >= 0 ? nameIdx : fallbackIdx(scan.parsed));
       if (!res.ok) { $('prog').textContent = res.error; return; }
       if (picked.length && namesLookWrong(res.rows, nameIdx)) { askPick('没认出哪列是顾问：到「⚙ 更多 › 高级设置 › 这张表抓哪些列」选好「人员列」再抓'); return; }
-      const step = saveStepFrom(nameIdx, picked);
-      const nraw = storeRaw(pageKey(), step.name, res, nameIdx);
-      const built = buildSources(res, nameIdx, picked, pageKey(), location.href, step.id);
-      const msgs = upsertSources(built.sources);
+      const addStep = $('addStep').checked;
+      let rg = pageRange(null);
+      if (!rg.tag) rg = pageRange({ headers: res.headers, rows: res.rows });
+      const histOnly = !addStep && rg.hist;
+      const step = addStep ? saveStepFrom(nameIdx, picked) : null;
+      const key = histOnly ? `${pageKey()}·${rg.tag}` : pageKey();
+      const nraw = storeRaw(key, step ? step.name : key, res, nameIdx, rg.tag);
+      const built = buildSources(res, nameIdx, picked, pageKey(), location.href, step ? step.id : null);
+      const msgs = histOnly ? [] : upsertSources(built.sources);
       const head = `【${pageKey()}】${res.pages} 页，${res.collected}${res.total != null ? '/' + res.total : ''} 条（明细 ${nraw} 行已存）` + (res.incomplete ? `  ⚠ 只抓到 ${res.collected}/${res.total} 条，可能没翻完页` : '');
       addLog([head].concat(built.lines).join('\n') + (msgs.length ? '\n   ' + msgs.join('；') : ''));
       const fcBad = built.sources.some(s => s.footer && !s.footer.ok);
-      $('prog').textContent = (res.incomplete ? `⚠ 只抓到 ${res.collected}/${res.total} 条` : `✅ 抓好了：${nraw} 条，已记进取数步骤`) + (fcBad ? '\n⚠ 和页面合计对不上，详见「更多 › 清空 / 记录」' : '');
+      $('prog').textContent = (res.incomplete ? `⚠ 只抓到 ${res.collected}/${res.total} 条` : (histOnly ? `✅ 抓好了：${nraw} 条，存为「${key}」（历史数据，不加入每日取数）` : step ? `✅ 抓好了：${nraw} 条，已记进取数步骤` : `✅ 抓好了：${nraw} 条（没加入每日取数）`)) + (fcBad ? '\n⚠ 和页面合计对不上，详见「更多 › 清空 / 记录」' : '');
       W.__ocqLastResult = { res: { pages: res.pages, collected: res.collected, total: res.total, incomplete: res.incomplete }, lines: built.lines, msgs, nraw };
       renderAll(); doScan();
     } catch (e) {
@@ -1748,6 +2027,7 @@
   $('go').onclick = startGrab;
   $('steps').addEventListener('click', e => {
     const a = e.target.dataset.a; if (!a) return;
+    if (a === 'rmraw') { const k = e.target.closest('[data-raw]').dataset.raw; if (!confirm(`删除历史数据「${k}」？`)) return; const r = getRaw(); delete r[k]; setRaw(r); renderAll(); return; }
     const i = +e.target.closest('[data-i]').dataset.i; const st = getSteps();
     if (a === 'up' && i > 0) [st[i - 1], st[i]] = [st[i], st[i - 1]];
     else if (a === 'down' && i < st.length - 1) [st[i + 1], st[i]] = [st[i], st[i + 1]];
@@ -1788,6 +2068,6 @@
   window.__ocqUS = W.__ocqUS = {
     openPanel, doScan, startGrab, startReplay, runReplay, getSources, getSteps, setSteps, computeRanking, getRoster, getSettings,
     parsePaste, num, analyze, exportExcel, drawCanvas, summaryRows, infoLine, timeProgress, redCut, setSettingsForTest: setSettings, findBestTable, rewriteMonthDates, root, isBusy: () => busy, isReplaying: () => replaying, FIXED_COLS,
-    getRaw, getTpls, saveTemplate, availablePresets, applyPreset, collapseProg, getUI: () => gmGet('ocq_ui', {}), buildPreset, openNewBox, openWizard, importTemplates, computeTemplate, compileFormula, rawTables, currentView, templateView, rankingView, groupRanking, openEditor, setRosterForTest: setRoster, renderAll
+    getRaw, getTpls, saveTemplate, availablePresets, applyPreset, collapseProg, fbPresets, applyFb, pageRange, parseDate, lastFullMonths, getUI: () => gmGet('ocq_ui', {}), buildPreset, openNewBox, openWizard, importTemplates, computeTemplate, compileFormula, rawTables, currentView, templateView, rankingView, groupRanking, openEditor, setRosterForTest: setRoster, renderAll
   };
 })();
