@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.5.7
+// @version      0.5.8
 // @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -639,7 +639,7 @@
     }
     function term() {
       let v = fac();
-      while (peek() === '*' || peek() === '/') { const op = toks[p++].t, r = fac(), l = v; v = op === '*' ? o => l(o) * r(o) : o => { const d = r(o); return d ? l(o) / d : 0; }; }
+      while (peek() === '*' || peek() === '/') { const op = toks[p++].t, r = fac(), l = v; v = op === '*' ? o => l(o) * r(o) : o => { const d = r(o); return d ? (l(o) == null ? null : l(o) / d) : null; }; }
       return v;
     }
     function fac() {
@@ -647,7 +647,7 @@
       if (!k) throw new Error('公式不完整');
       if (k.t === '-') { const f = fac(); return o => -f(o); }
       if (k.t === 'n') return () => k.v;
-      if (k.t === 'id') return o => (typeof o[k.v] === 'number' && isFinite(o[k.v]) ? o[k.v] : 0);
+      if (k.t === 'id') return o => (o[k.v] === null ? null : typeof o[k.v] === 'number' && isFinite(o[k.v]) ? o[k.v] : 0);
       if (k.t === '(') { const v = expr(); if (peek() !== ')') throw new Error('括号没配对'); p++; return v; }
       throw new Error('公式写法不对');
     }
@@ -683,9 +683,11 @@
   const isMonthCol = h => /^月份/.test(h || '');
   /** 条件：包含/等于/不包含（不分大小写）、日期在…之间；表里没有这一列的条件不作用在这张表上 */
   const monthEnd = ym => { const [y, m] = ym.split('-').map(Number); return `${ym}-${String(new Date(Date.UTC(y, m, 0)).getUTCDate()).padStart(2, '0')}`; };
+  const blankish = v => /^(|-+|—+|－+|\/|null|undefined|无)$/i.test(String(v == null ? '' : v).replace(/[\s\u00a0\u3000]+/g, ''));
   function rowPass(t, r, conds) {
     for (const f of conds || []) {
       if (!f || !f.col) continue;
+      if (f.op === 'anyFilled') { const is = (f.cols || []).map(c => t.headers.indexOf(c)).filter(i => i >= 0); if (!is.some(i => !blankish(r[i]))) return false; continue; }
       const i = t.headers.indexOf(f.col);
       if (i < 0) continue;
       const v = r[i];
@@ -701,14 +703,15 @@
         if (f.to && d > f.to) return false;
         continue;
       }
-      if (f.op === 'empty') { if (String(v == null ? '' : v).trim()) return false; continue; }
+      if (f.op === 'empty') { if (!blankish(v)) return false; continue; }
+      if (f.op === 'filled') { if (blankish(v)) return false; continue; }
       const a = lc(v), b = lc(f.value);
       if (!b) continue;
       if (f.op === 'eq' ? a !== b : f.op === 'not' ? a.includes(b) : !a.includes(b)) return false;
     }
     return true;
   }
-  const activeConds = cs => (cs || []).filter(f => f && f.col && (f.op === 'empty' || (f.op === 'between' ? (f.from || f.to) : String(f.value || '').trim())));
+  const activeConds = cs => (cs || []).filter(f => f && f.col && (f.op === 'empty' || f.op === 'filled' || f.op === 'anyFilled' || (f.op === 'between' ? (f.from || f.to) : String(f.value || '').trim())));
 
   // ---- 数据表角色：成交表必须有非零成交金额 + 成交时间/日期，且不是看位/邀约/线索/无效表 ----
   const colHasData = (t, col) => { const i = t.headers.indexOf(col); return i >= 0 && t.rows.some(r => { const v = num(r[i]); return v != null && v !== 0; }); };
@@ -998,6 +1001,7 @@
       if (TOT) { const o = Object.assign({}, TOT); o[gb[0]] = '合计'; gb.slice(1).forEach(h => { o[h] = ''; }); o.__sum = true; sums.push(o); }
     }
     let outCols = gb.concat(labels);
+    if (tpl.colOrder) outCols = gb.concat(tpl.colOrder.filter(c => labels.includes(c)), labels.filter(c => !tpl.colOrder.includes(c)));
     outCols = outCols.filter(c => !(deltas.some(d => d.label === c) && rows.every(r => r[c] === '' || r[c] == null)));
     if (gb.length >= 2) { const mc = gb.find(isMonthCol); if (mc && new Set(rows.map(r => r[mc])).size <= 1) outCols = outCols.filter(c => c !== mc); }
     return { cols: outCols, rows, sums, warn, used: [...usedNames], emptyWhy, notes, pick: pickInfo[0] || null, fmt, groupCols: gb, calcLabels: calcs.filter(c => !c.delta).map(c => c.label), deltaCols: deltas.map(c => c.label) };
@@ -1152,6 +1156,7 @@
     return { kind: 'rank', name: '顾问排行', file: `OCQ顾问排行_${stamp()}`, sheets: [main, grp], warn: [] };
   }
   function fmtT(f, v) {
+    if (v === null && (f === 'pct' || f === 'pctd')) return '—';
     if (v == null || v === '') return '';
     if (typeof v !== 'number') return String(v);
     if (f === 'pct') return (v * 100).toFixed(1) + '%';
@@ -1172,7 +1177,7 @@
     const sheet = {
       sheet: safe, title: tpl.name || '自定义报表', info, cols: r.cols, rows: r.rows, sums: r.sums,
       numFmt: c => XF[r.fmt[c]] || '@', text, green: c => r.groupCols.includes(c) || r.calcLabels.includes(c),
-      red: (c, row) => (r.deltaCols.includes(c) ? typeof row[c] === 'number' && row[c] < -1e-12 : !!red && c === red.col && !row.__sum && typeof row[c] === 'number' && row[c] < cut - 1e-12),
+      red: (c, row) => (c === '无效客资' && !row.__sum && typeof row[c] === 'number' && row[c] > 0) || (r.deltaCols.includes(c) ? typeof row[c] === 'number' && row[c] < -1e-12 : !!red && c === red.col && !row.__sum && typeof row[c] === 'number' && row[c] < cut - 1e-12),
       up: (c, row) => r.deltaCols.includes(c) && typeof row[c] === 'number' && row[c] > 1e-12,
       width: c => autoWidth(c, all, text), freezeCols: r.groupCols.length
     };
@@ -1647,7 +1652,7 @@
     const [from, to] = String(tpl.range).split('~');
     if (!from || !to) return tpl;
     let x = null;
-    try { x = fbPresets(from, to, { validRule: tpl.validRuleUser }).find(p => p.key === tpl.presetKey); } catch (e) { x = null; }
+    try { x = fbPresets(from, to, { validRule: tpl.validRuleUser && tpl.validRuleUser.mode !== 'empty' ? tpl.validRuleUser : null }).find(p => p.key === tpl.presetKey); } catch (e) { x = null; }
     if (!x) return tpl;
     const n = Object.assign({}, tpl, x.tpl, { id: tpl.id, name: tpl.name });
     if (force || JSON.stringify(n) !== JSON.stringify(tpl)) { const tp = getTpls(), i = tp.findIndex(y => y.id === tpl.id); if (i >= 0) { tp[i] = n; setTpls(tp); } }
@@ -1683,9 +1688,9 @@
     $('warn').textContent = (v.warn || []).join('；');
     $('rkwrap').innerHTML = v.sheets.map((s, si) => `<table class="rk">${v.sheets.length > 1 || si ? `<caption>${esc(s.title)}</caption>` : ''}<tr>${s.cols.map(c => `<th>${esc(c)}</th>`).join('')}</tr>` +
       (s.rows.length ? s.rows.concat(s.sums).map(r => `<tr>${s.cols.map(c => `<td class="${r.__sum ? 's' : s.green(c) ? 'g' : ''} ${s.red(c, r) ? 'red' : s.up && s.up(c, r) ? 'up' : ''}">${esc(s.text(c, r[c]))}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${s.cols.length}" class="muted">${v.emptyWhy ? esc(v.emptyWhy) + ' <button class="mini" id="regen">重新生成</button>' : '（还没有数据）'}</td></tr>`) + '</table>').join('') +
-      (v.used && v.used.length ? `<div class="muted" id="usedLine" style="font-size:11px;margin-top:2px">数据来自：${esc(v.used.join('、'))}${v.validRule ? ' · 有效客资＝' + esc(ruleText(v.validRule)) : v.validOptions ? ' · 有效客资：没认出' : ''}` +
+      (v.used && v.used.length ? `<div class="muted" id="usedLine" style="font-size:11px;margin-top:2px">数据来自：${esc(v.used.join('、'))}${v.validRule ? ' · 无效客资＝' + esc(invText(v.validRule)) + '，有效＝客资−无效' : v.validOptions ? ' · 无效客资：没认出' : ''}` +
         (v.pick && v.pick.cand.length > 1 ? ` <select id="srcPick" style="font-size:11px;max-width:200px"><option value="">换一张表 ▾</option>${v.pick.cand.map(c => `<option value="${esc(c.pk)}">${c.pk === v.pick.cur ? '✓ ' : ''}${esc(c.name)}</option>`).join('')}</select>` : '') + '</div>' : '') +
-      (v.validOptions ? `<div class="muted" style="font-size:11px">有效客资怎么算：<select id="validPick" style="font-size:11px;max-width:260px">${v.validOptions.map((o, i) => `<option value="${i}" ${JSON.stringify(o) === JSON.stringify(v.validRule) ? 'selected' : ''}>${esc(ruleText(o))}</option>`).join('')}${v.validRule ? '' : '<option selected value="">（没认出怎么判断有效，请选一个）</option>'}</select></div>` : '') +
+      (v.validOptions ? `<div class="muted" style="font-size:11px">无效客资怎么算：<select id="validPick" style="font-size:11px;max-width:260px">${v.validOptions.map((o, i) => `<option value="${i}" ${JSON.stringify(o) === JSON.stringify(v.validRule) ? 'selected' : ''}>${esc(invText(o))}</option>`).join('')}${v.validRule ? '' : '<option selected value="">（没认出怎么判断无效，请选一个）</option>'}</select></div>` : '') +
       (v.notes && v.notes.length ? `<div class="muted" style="font-size:11px">${v.notes.map(esc).join('<br>')}</div>` : '');
     const vp = $('validPick');
     if (vp) vp.onchange = () => { const tp = getTpls(), t = tp.find(x => x.id === v.tplId); if (!t || vp.value === '') return; t.validRuleUser = v.validOptions[+vp.value]; setTpls(tp); regenPreset(t, true); renderRanking(); };
@@ -1787,12 +1792,32 @@
     const score = p => p.t.rows.filter(r => rowPass(p.t, r, dc)).length;
     const best = f => prof.filter(p => ok(p) && f(p)).sort((a, b) => (score(b) > 0) - (score(a) > 0) || b.t.time - a.t.time)[0] || null;
     const valid = prof.filter(p => ok(p) && isValidTab(p) && score(p) > 0).sort((a, b) => b.t.time - a.t.time);
-    return { from, to, order: best(isOrderTab), lead: best(isLeadTab), valid: valid[0] || null, validAll: valid, score };
+    const inval = prof.filter(p => ok(p) && tableRole(p.t) === 'invalid' && score(p) > 0 && (p.t.range || !p.t.noDate)).sort((a, b) => b.t.time - a.t.time);
+    return { from, to, order: best(isOrderTab), lead: best(isLeadTab), valid: valid[0] || null, validAll: valid, invalAll: inval, score };
   }
   function fbConds(R, tabs) {
     const cols = [...new Set(tabs.filter(Boolean).map(chanCol).filter(Boolean))];
     return cols.map(c => ({ col: c, op: 'contains', value: 'facebook' })).concat([{ col: '日期', op: 'between', from: R.from, to: R.to }]);
   }
+  const invText = r => !r ? '' : r.mode === 'table' ? `用「${r.name || r.table}」表的条数` : r.mode === 'filled' ? `线索表里「${r.cols.join('」或「')}」有值` : `线索表里「${r.col}」${r.op === 'eq' ? '等于' : '含'}「${r.value}」`;
+  function invalidOptions(R) {
+    const out = R.invalAll.map(p => ({ mode: 'table', table: p.t.pageKey, name: p.t.name }));
+    if (R.lead) {
+      const H = R.lead.t.headers.filter(h => !isMonthCol(h) && h !== '日期');
+      const tc = H.filter(h => /无效/.test(h) && /时间|日期/.test(h));
+      tc.forEach(h => out.push({ mode: 'filled', cols: [h] }));
+      const rc = H.filter(h => /跑单/.test(h) && /时间|日期/.test(h));
+      if (tc.length && rc.length) out.push({ mode: 'filled', cols: tc.concat(rc) });
+      for (const h of H.filter(h => /状态|是否有效|有效性|判定|结果/.test(h) && !/时间|日期/.test(h))) {
+        const i = R.lead.t.headers.indexOf(h), cnt = {};
+        R.lead.t.rows.forEach(r => { const v = String(r[i] || '').trim(); if (v) cnt[v] = (cnt[v] || 0) + 1; });
+        if (Object.keys(cnt).some(v => /无效/.test(v))) out.push({ mode: 'eq', op: 'contains', col: h, value: '无效' });
+        Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a]).slice(0, 6).filter(v => !/^无效$/.test(v)).forEach(v => out.push({ mode: 'eq', op: 'eq', col: h, value: v }));
+      }
+    }
+    return out;
+  }
+  const invCols = t => (tableRole(t) === 'lead' ? t.headers.filter(h => /无效/.test(h) && /时间|日期/.test(h) && !isMonthCol(h)) : []);
   const ruleText = r => !r ? '' : r.mode === 'table' ? `用「${r.name || r.table}」表` : r.mode === 'empty' ? `线索表里「${r.cols.join('」和「')}」为空` : `线索表里「${r.col}」${r.op === 'eq' ? '等于' : '含'}「${r.value}」`;
   function validOptions(R) {
     const out = R.validAll.map(p => ({ mode: 'table', table: p.t.pageKey, name: p.t.name }));
@@ -1820,20 +1845,20 @@
       if (R.lead) {
         const ms = [{ src: '__rows', agg: 'rows', label: '客资', fmt: 'int', table: R.lead.t.pageKey }];
         let rate = '成单/客资', rateName = '成单率(按总客资)';
-        // 有效客资怎么算：用户选的 > 范围内的「判定有效」表 > 线索表「无效/跑单时间」为空 > 状态列含「有效」
-        const opts = validOptions(R);
+        // 无效客资怎么算：用户选的 > 覆盖范围的「无效」表 > 线索表「无效通过时间」有值 > 状态列含「无效」
+        const opts = invalidOptions(R);
         let vr = opt.validRule && opts.some(o => JSON.stringify(o) === JSON.stringify(opt.validRule)) ? opt.validRule : null;
-        if (!vr) vr = opts.find(o => o.mode === 'table') || opts.find(o => o.mode === 'empty') || null;
-        if (!vr && validityCol(R.lead)) { const vc = validityCol(R.lead); vr = { mode: 'eq', op: 'contains', col: vc, value: '有效' }; }
-        if (vr) {
-          const m = vr.mode === 'table' ? { src: '__rows', agg: 'rows', label: '有效客资', fmt: 'int', table: vr.table, role: 'valid' }
-            : { src: '__rows', agg: 'rows', label: '有效客资', fmt: 'int', table: R.lead.t.pageKey, role: 'lead', where: vr.mode === 'empty' ? vr.cols.map(c => ({ col: c, op: 'empty' })) : [{ col: vr.col, op: vr.op || 'eq', value: vr.value }].concat(vr.op === 'contains' ? [{ col: vr.col, op: 'not', value: '无效' }] : []) };
-          ms.push(m); rate = '成单/有效客资'; rateName = '有效客资成单率';
-        }
+        if (!vr) vr = opts.find(o => o.mode === 'table') || opts.find(o => o.mode === 'filled') || opts.find(o => o.mode === 'eq' && o.op === 'contains') || null;
         ms[0].role = 'lead';
+        if (vr) {
+          ms.push(vr.mode === 'table' ? { src: '__rows', agg: 'rows', label: '无效客资', fmt: 'int', table: vr.table, role: 'invalid' }
+            : { src: '__rows', agg: 'rows', label: '无效客资', fmt: 'int', table: R.lead.t.pageKey, role: 'lead', where: vr.mode === 'filled' ? [{ col: '__any', op: 'anyFilled', cols: vr.cols }] : [{ col: vr.col, op: vr.op || 'eq', value: vr.value }] });
+          rate = '成单/有效客资'; rateName = '有效客资成单率';
+        }
         var fb3Valid = { rule: vr, options: opts };
         ms.push({ src: '__rows', agg: 'rows', label: '成单', fmt: 'int', table: R.order.t.pageKey });
-        out.push({ key: 'fb3', name: 'FB·客资与成单率', tpl: { name: 'FB·客资与成单率', validRule: fb3Valid.rule, validOptions: fb3Valid.options, groupBy: ['顾问', '月份'], filters: fbConds(R, [R.order, R.lead, fb3Valid.rule && fb3Valid.rule.mode === 'table' ? R.validAll.find(p => p.t.pageKey === fb3Valid.rule.table) : null]), metrics: ms, calcs: [{ label: rateName, formula: rate, fmt: 'pct' }, { label: '浮动', delta: rateName, formula: '', fmt: 'pctd' }], sort: { col: '成单', dir: 'desc' }, red: {}, total: true } });
+        const fbCalcs = vr ? [{ label: '有效客资', formula: '客资-无效客资', fmt: 'int' }, { label: rateName, formula: rate, fmt: 'pct' }] : [{ label: rateName, formula: rate, fmt: 'pct' }];
+        out.push({ key: 'fb3', name: 'FB·客资与成单率', tpl: { name: 'FB·客资与成单率', validRule: fb3Valid.rule, validOptions: fb3Valid.options, groupBy: ['顾问', '月份'], filters: fbConds(R, [R.order, R.lead, fb3Valid.rule && fb3Valid.rule.mode === 'table' ? R.invalAll.find(p => p.t.pageKey === fb3Valid.rule.table) : null]), colOrder: ['客资', '无效客资', '有效客资', '成单', rateName], metrics: ms, calcs: fbCalcs.concat([{ label: '浮动', delta: rateName, formula: '', fmt: 'pctd' }]), sort: { col: '成单', dir: 'desc' }, red: {}, total: true } });
       }
     }
     const nameOf = pk => (colProfile().find(p => p.t.pageKey === pk) || { t: { name: pk } }).t.name;
@@ -1972,6 +1997,7 @@
         const mk = 'n' + ti, otherOpen = wizOpen[mk] || others.some(c => has(p.t.pageKey, c.h));
         h += `<div class="muted" style="margin:8px 0 4px">${ti ? `来自另一张表「${esc(p.t.name)}」<span class="muted">（按「${esc(ed.groupBy.join(' / '))}」对上）</span>` : `来自「${esc(p.t.name)}」`}</div><div class="checks">` +
           `<label class="ck"><input type="checkbox" data-m="${key(p.t.pageKey, '__rows')}" ${has(p.t.pageKey, '__rows') ? 'checked' : ''}> ${ti ? `单数 · ${esc(p.t.name)}` : '单数（条数）'}</label>` +
+          (invCols(p.t).length ? `<label class="ck"><input type="checkbox" data-m="${key(p.t.pageKey, '__inv')}" ${ed.metrics.some(m => m.inv && m.table === p.t.pageKey) ? 'checked' : ''}> 无效客资 <span class="muted">（${esc(invCols(p.t).join('/'))} 有值）</span></label>` : '') +
           ncs.map(c => `<label class="ck"><input type="checkbox" data-m="${key(p.t.pageKey, c.h)}" ${has(p.t.pageKey, c.h) ? 'checked' : ''}> ${esc(c.h)}${ti ? ' · ' + esc(p.t.name) : ''} <span class="muted">${c.money ? '金额，求和' : '求和'}</span></label>`).join('') + '</div>' +
           (others.length ? `<details class="morecols" data-mk="${mk}" ${otherOpen ? 'open' : ''}><summary class="muted">更多 ▾（${others.length} 列）</summary><div class="checks">${others.map(c => `<label class="ck sm"><input type="checkbox" data-m="${key(p.t.pageKey, c.h)}" ${has(p.t.pageKey, c.h) ? 'checked' : ''}> ${esc(c.h)}${ti ? ' · ' + esc(p.t.name) : ''}</label>`).join('')}</div></details>` : '');
       });
@@ -2141,8 +2167,11 @@
     const t = e.target;
     if (t.dataset.m != null) {
       const [pk, src] = t.dataset.m.split('\u0001');
-      if (t.checked) { if (!ed.metrics.some(m => m.table === pk && m.src === src)) { const m = { src, agg: src === '__rows' ? 'rows' : 'sum', table: pk }; m.label = metricLabel(m); ed.metrics.push(m); } }
-      else ed.metrics = ed.metrics.filter(m => !(m.table === pk && m.src === src));
+      if (src === '__inv') {
+        ed.metrics = ed.metrics.filter(m => !(m.inv && m.table === pk));
+        if (t.checked) { const tb = colProfile().find(x => x.t.pageKey === pk); ed.metrics.push({ src: '__rows', agg: 'rows', label: '无效客资', fmt: 'int', table: pk, inv: true, role: tb ? tableRole(tb.t) : '', where: [{ col: '__any', op: 'anyFilled', cols: tb ? invCols(tb.t) : [] }] }); }
+      } else if (t.checked) { if (!ed.metrics.some(m => m.table === pk && m.src === src)) { const m = { src, agg: src === '__rows' ? 'rows' : 'sum', table: pk }; m.label = metricLabel(m); ed.metrics.push(m); } }
+      else ed.metrics = ed.metrics.filter(m => !(m.table === pk && m.src === src && !m.inv));
       readWizard(); renderWizard();
     } else if (t.dataset.agg != null) {
       const [pk, src] = t.dataset.agg.split('\u0001');
