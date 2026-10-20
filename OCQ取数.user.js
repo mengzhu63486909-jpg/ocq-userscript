@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.5.5
+// @version      0.5.6
 // @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -665,12 +665,18 @@
   const lc = s => String(s == null ? '' : s).replace(/\s+/g, '').toLowerCase();
   const isMonthCol = h => /^月份/.test(h || '');
   /** 条件：包含/等于/不包含（不分大小写）、日期在…之间；表里没有这一列的条件不作用在这张表上 */
+  const monthEnd = ym => { const [y, m] = ym.split('-').map(Number); return `${ym}-${String(new Date(Date.UTC(y, m, 0)).getUTCDate()).padStart(2, '0')}`; };
   function rowPass(t, r, conds) {
     for (const f of conds || []) {
       if (!f || !f.col) continue;
       const i = t.headers.indexOf(f.col);
       if (i < 0) continue;
       const v = r[i];
+      if (f.op === 'between' && t.noDate && (f.col === '日期' || isMonthCol(f.col))) {
+        const a = t.noDate.from + '-01', b = monthEnd(t.noDate.to);
+        if ((f.to && a > f.to) || (f.from && b < f.from)) return false;
+        continue;
+      }
       if (f.op === 'between') {
         const d = parseDate(v) || (/^\d{4}-\d{2}$/.test(v) ? v + '-01' : '');
         if (!d) return false;
@@ -689,8 +695,18 @@
   // ---- 数据表角色：成交表必须有非零成交金额 + 成交时间/日期，且不是看位/邀约/线索/无效表 ----
   const colHasData = (t, col) => { const i = t.headers.indexOf(col); return i >= 0 && t.rows.some(r => { const v = num(r[i]); return v != null && v !== 0; }); };
   const ORDER_DATE = /成交时间|成交日期|签约/;
-  const isOrderTable = t => !/看位|邀约|线索|无效/.test(t.name) && colHasData(t, '成交金额') && t.headers.some(h => ORDER_DATE.test(h) && !/^月份/.test(h));
-  const tableRole = t => (isOrderTable(t) ? 'order' : /有效/.test(t.name) && !/无效/.test(t.name) ? 'valid' : 'lead');
+  /** 页面名优先：无效 > 看位/邀约 > 成交 > 有效 > 线索/客资；名字认不出才看列 */
+  const nameRole = n => { n = String(n || '').split('·')[0]; return /无效/.test(n) ? 'invalid' : /看位|邀约/.test(n) ? 'visit' : /成交/.test(n) ? 'order' : /有效/.test(n) ? 'valid' : /线索|客资/.test(n) ? 'lead' : ''; };
+  const tableRole = t => nameRole(t.name) || (colHasData(t, '成交金额') && t.headers.some(h => ORDER_DATE.test(h) && !/^月份/.test(h)) ? 'order' : 'lead');
+  const isOrderTable = t => tableRole(t) === 'order';
+  /** 范围标签 → {from:'YYYY-MM', to:'YYYY-MM'}；支持 2026-06 / 2026-06~08 / 2026-06~2026-08 */
+  function parseRange(s) {
+    const m = String(s || '').match(/^(\d{4})-(\d{2})(?:\s*~\s*(?:(\d{4})-)?(\d{2}))?$/);
+    if (!m) return null;
+    return { from: `${m[1]}-${m[2]}`, to: m[4] ? `${m[3] || m[1]}-${m[4]}` : `${m[1]}-${m[2]}` };
+  }
+  const rangeLabel = R => (R.from === R.to ? R.from : `${R.from}~${R.to.slice(0, 4) === R.from.slice(0, 4) ? R.to.slice(5) : R.to}`);
+  const rangeText = R => (R.from === R.to ? `${+R.from.slice(5)}月` : `${+R.from.slice(5)}–${+R.to.slice(5)}月`);
   /** 已抓明细表（附加虚拟列：顾问、所属小组、日期、月份、月份(某日期列)） */
   function rawTables(roster) {
     const ro = new Map((roster || []).map(r => [norm(r.name), r]));
@@ -705,9 +721,17 @@
       const dc = detectDateCols(base, t.rows);
       for (const d of dc) add.push([`月份(${base[d]})`, r => ymOf(r[d])]);
       const pd = primaryDate(base, dc);
+      let noDate = null;
       if (pd >= 0) { add.push(['日期', r => parseDate(r[pd])]); add.push(['月份', r => ymOf(r[pd])]); }
+      else {
+        // 没有日期列：有范围标签按整段算；没有范围按本月算
+        const td = today8();
+        noDate = parseRange(t.range) || { from: `${td.y}-${String(td.m).padStart(2, '0')}`, to: `${td.y}-${String(td.m).padStart(2, '0')}` };
+        const lab = rangeLabel(noDate);
+        add.push(['日期', () => '']); add.push(['月份', () => lab]);
+      }
       if (add.length) { headers = headers.concat(add.map(a => a[0])); rows = rows.map(r => r.concat(add.map(a => a[1](r)))); }
-      return { name: t.name, pageKey: t.pageKey, headers, rows, time: t.time, dateCol: pd >= 0 ? base[pd] : '', dateCols: dc.map(i => base[i]).concat(pd >= 0 ? ['日期'] : []), range: t.range || '' };
+      return { name: t.name, pageKey: t.pageKey, headers, rows, time: t.time, dateCol: pd >= 0 ? base[pd] : '', dateCols: dc.map(i => base[i]).concat(pd >= 0 ? ['日期'] : []), range: t.range || '', noDate };
     });
   }
   function knownHeaders() {
@@ -731,7 +755,8 @@
     // 合格的表：指标列要有数据；成交类要成交表；打分 = 首选日期列 > 范围内有数据 > 最近抓
     const qualifying = (tables, m, gb, role) => {
       const ok = t => (m.src === '__rows' || (t.headers.includes(m.src) && (!/金额|收款|未收|合同/.test(m.src) || colHasData(t, m.src)))) && gb.every(g => t.headers.includes(g)) && (!role || tableRole(t) === role);
-      const sc = t => (role === 'order' && ORDER_DATE.test(t.dateCol || '') ? 4 : 0) + (passRows(t, m).length ? 8 : 0);
+      const hasDateF = conds.some(f => f.op === 'between');
+      const sc = t => (role === 'order' && ORDER_DATE.test(t.dateCol || '') ? 4 : 0) + (passRows(t, m).length ? 8 : 0) + (!hasDateF && !t.range ? 2 : 0);
       let list = tables.filter(ok);
       if (!list.length && role === 'order') {
         // 兜底：放宽为「有成交金额列、不是看位/邀约/线索/无效表」
@@ -750,11 +775,16 @@
         // 按「角色 + 列名」绑定：不认死某张表；几张都合适时用最近抓的（优先有数据的）
         const bt = tables.find(t => t.pageKey === m.table) || tables.find(t => baseOf(t.pageKey) === baseOf(m.table));
         let role = m.role || (bt ? roleOf(bt) : '');
-        if (m.src === '成交金额' || /成交|成单/.test(m.label)) role = 'order';
+        if (m.src === '成交金额' || /成交|成单|^单数/.test(m.label)) role = 'order';
         const cand = qualifying(tables, m, gb, role);
         const ov = tpl.srcPick && tpl.srcPick[role || '_'];
         const pick = (ov && cand.find(t => t.pageKey === ov)) || cand[0];
         ts = pick ? [pick] : [];
+        // 按月分组 + 选中的是「无日期列、按范围抓」的表：把其他不重叠的范围表也拼进来（每月各抓一次 → 每月一列）
+        if (pick && pick.noDate && !ov && gb.some(isMonthCol)) {
+          const ovl = (x, y) => !(x.to < y.from || y.to < x.from);
+          for (const t of cand) if (t !== pick && t.noDate && passRows(t, m).length && ts.every(u => !ovl(u.noDate, t.noDate) && baseOf(u.pageKey) === baseOf(t.pageKey))) ts.push(t);
+        }
         if (!pickInfo.length || role === 'order') pickInfo.unshift({ role: role || '_', cand: cand.map(t => ({ pk: t.pageKey, name: t.name })), cur: pick ? pick.pageKey : '' });
       } else ts = tables.filter(fits);
       ts.forEach(t => usedNames.add(t.name));
@@ -828,6 +858,11 @@
     };
     const cmp = cmpBy(sc, dir);
     let rows = build(ALL).map(finish);
+    const notes = [];
+    if (gb.some(isMonthCol)) for (const { ts } of plan) for (const { t } of ts) if (t.noDate && t.noDate.from !== t.noDate.to) {
+      const n = `「${t.name}」没有成交时间列，按整段 ${rangeText(t.noDate)} 统计；要分月请在 OCQ 加出成交时间列再抓，或每月各抓一次`;
+      if (!notes.includes(n)) notes.push(n);
+    }
     let emptyWhy = '';
     if (!rows.length) {
       const p0 = plan.find(x => x.ts.length);
@@ -876,7 +911,7 @@
       const pvs = [...new Set(rows.map(r => r[pc]))].sort();
       const vl = (tpl.pivot.metrics && tpl.pivot.metrics.length ? tpl.pivot.metrics : labels.filter(l => !deltas.some(c => c.label === l))).filter(l => labels.includes(l));
       const sameYear = new Set(pvs.map(p => p.slice(0, 4))).size <= 1;
-      const pvName = p => (/^\d{4}-\d{2}$/.test(p) ? (sameYear ? `${+p.slice(5)}月` : `${p.slice(2, 4)}年${+p.slice(5)}月`) : p);
+      const pvName = p => (parseRange(p) && /~/.test(p) ? rangeText(parseRange(p)) : /^\d{4}-\d{2}$/.test(p) ? (sameYear ? `${+p.slice(5)}月` : `${p.slice(2, 4)}年${+p.slice(5)}月`) : p);
       const colName = (L, p) => (vl.length === 1 ? pvName(p) : `${L}·${pvName(p)}`);
       const totName = L => (vl.length === 1 ? '合计' : `${L}·合计`);
       const key = o => rowGb.map(h => o[h]).join('\u0001');
@@ -913,7 +948,7 @@
         withDelta(o);
         sums.push(o);
       }
-      return { cols, rows: prow, sums, warn, used: [...usedNames], emptyWhy, pick: pickInfo[0] || null, fmt: pfmt, groupCols: rowGb, calcLabels: [], deltaCols: dcol };
+      return { cols, rows: prow, sums, warn, used: [...usedNames], emptyWhy, notes, pick: pickInfo[0] || null, fmt: pfmt, groupCols: rowGb, calcLabels: [], deltaCols: dcol };
     }
 
     let subs = [];
@@ -929,7 +964,7 @@
       for (const s of subs) sums.push(Object.assign({}, s, { __sum: true, [gb[0]]: s[gb[0]] + ' 小计', [gb[1]]: '' }));
       if (TOT) { const o = Object.assign({}, TOT); o[gb[0]] = '合计'; gb.slice(1).forEach(h => { o[h] = ''; }); o.__sum = true; sums.push(o); }
     }
-    return { cols: gb.concat(labels), rows, sums, warn, used: [...usedNames], emptyWhy, pick: pickInfo[0] || null, fmt, groupCols: gb, calcLabels: calcs.filter(c => !c.delta).map(c => c.label), deltaCols: deltas.map(c => c.label) };
+    return { cols: gb.concat(labels), rows, sums, warn, used: [...usedNames], emptyWhy, notes, pick: pickInfo[0] || null, fmt, groupCols: gb, calcLabels: calcs.filter(c => !c.delta).map(c => c.label), deltaCols: deltas.map(c => c.label) };
   }
 
   // ---------------- 排行 ----------------
@@ -1105,7 +1140,7 @@
       up: (c, row) => r.deltaCols.includes(c) && typeof row[c] === 'number' && row[c] > 1e-12,
       width: c => autoWidth(c, all, text), freezeCols: r.groupCols.length
     };
-    return { kind: 'tpl', name: tpl.name, file: `OCQ_${safe}_${stamp()}`, sheets: [sheet], warn: r.warn, used: r.used, emptyWhy: r.emptyWhy, pick: r.pick, tplId: tpl.id };
+    return { kind: 'tpl', name: tpl.name, file: `OCQ_${safe}_${stamp()}`, sheets: [sheet], warn: r.warn, used: r.used, emptyWhy: r.emptyWhy, notes: r.notes, pick: r.pick, tplId: tpl.id };
   }
   const asView = x => (x && x.sheets ? x : rankingView(x));
 
@@ -1567,7 +1602,7 @@
   function currentView() {
     const st = getSettings();
     let tpl = st.tpl && getTpls().find(t => t.id === st.tpl);
-    if (tpl) { tpl = regenPreset(tpl); return templateView(tpl); }
+    if (tpl) { tpl = fixBindings(regenPreset(tpl)); return templateView(tpl); }
     return rankingView(computeRanking(getSources(), getRoster(), st));
   }
   /** 预设报表：每次打开按当前已抓数据重新生成配置（只保留名字、id、日期范围） */
@@ -1580,6 +1615,21 @@
     if (!x) return tpl;
     const n = Object.assign({}, tpl, x.tpl, { id: tpl.id, name: tpl.name });
     if (force || JSON.stringify(n) !== JSON.stringify(tpl)) { const tp = getTpls(), i = tp.findIndex(y => y.id === tpl.id); if (i >= 0) { tp[i] = n; setTpls(tp); } }
+    return n;
+  }
+  /** 旧模板：成交类指标绑在非成交表上 → 改绑到最近的成交表并保存 */
+  function fixBindings(tpl) {
+    const raw = getRaw(), role = pk => (raw[pk] ? tableRole(rawTables([]).find(x => x.pageKey === pk) || raw[pk]) : nameRole(pk));
+    const orders = Object.values(raw).filter(x => nameRole(x.name) === 'order').sort((a, b) => (!b.range) - (!a.range) || b.time - a.time);
+    if (!orders.length) return tpl;
+    let changed = false;
+    const ms = (tpl.metrics || []).map(m => {
+      if (!(m.src === '成交金额' || /成交|成单|^单数/.test(m.label)) || role(m.table) === 'order') return m;
+      changed = true; return Object.assign({}, m, { table: orders[0].pageKey });
+    });
+    if (!changed) return tpl;
+    const n = Object.assign({}, tpl, { metrics: ms }), tp = getTpls(), i = tp.findIndex(y => y.id === tpl.id);
+    if (i >= 0) { tp[i] = n; setTpls(tp); }
     return n;
   }
   function renderTplSel() {
@@ -1598,7 +1648,8 @@
     $('rkwrap').innerHTML = v.sheets.map((s, si) => `<table class="rk">${v.sheets.length > 1 || si ? `<caption>${esc(s.title)}</caption>` : ''}<tr>${s.cols.map(c => `<th>${esc(c)}</th>`).join('')}</tr>` +
       (s.rows.length ? s.rows.concat(s.sums).map(r => `<tr>${s.cols.map(c => `<td class="${r.__sum ? 's' : s.green(c) ? 'g' : ''} ${s.red(c, r) ? 'red' : s.up && s.up(c, r) ? 'up' : ''}">${esc(s.text(c, r[c]))}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${s.cols.length}" class="muted">${v.emptyWhy ? esc(v.emptyWhy) + ' <button class="mini" id="regen">重新生成</button>' : '（还没有数据）'}</td></tr>`) + '</table>').join('') +
       (v.used && v.used.length ? `<div class="muted" id="usedLine" style="font-size:11px;margin-top:2px">数据来自：${esc(v.used.join('、'))}` +
-        (v.pick && v.pick.cand.length > 1 ? ` <select id="srcPick" style="font-size:11px;max-width:200px"><option value="">换一张表 ▾</option>${v.pick.cand.map(c => `<option value="${esc(c.pk)}">${c.pk === v.pick.cur ? '✓ ' : ''}${esc(c.name)}</option>`).join('')}</select>` : '') + '</div>' : '');
+        (v.pick && v.pick.cand.length > 1 ? ` <select id="srcPick" style="font-size:11px;max-width:200px"><option value="">换一张表 ▾</option>${v.pick.cand.map(c => `<option value="${esc(c.pk)}">${c.pk === v.pick.cur ? '✓ ' : ''}${esc(c.name)}</option>`).join('')}</select>` : '') + '</div>' : '') +
+      (v.notes && v.notes.length ? `<div class="muted" style="font-size:11px">${v.notes.map(esc).join('<br>')}</div>` : '');
     const sp = $('srcPick');
     if (sp) sp.onchange = () => { if (!sp.value) return; const tp = getTpls(), t = tp.find(x => x.id === v.tplId); if (!t) return; t.srcPick = Object.assign({}, t.srcPick, { [v.pick.role]: sp.value }); setTpls(tp); renderRanking(); };
     const rg = $('regen');
@@ -1643,7 +1694,8 @@
   /** 选出最合适的那张表：含全部分组列 + 选中数字列最多 + 行最多 */
   function bestTable(prof, gb, wantCols) {
     const ok = prof.filter(p => gb.every(g => p.t.headers.includes(g)));
-    ok.sort((a, b) => wantCols.filter(c => b.t.headers.includes(c)).length - wantCols.filter(c => a.t.headers.includes(c)).length || b.t.rows.length - a.t.rows.length);
+    const ord = p => (tableRole(p.t) === 'order' ? 1 : 0) + (!p.t.range ? 0.5 : 0);
+    ok.sort((a, b) => ord(b) - ord(a) || wantCols.filter(c => b.t.headers.includes(c)).length - wantCols.filter(c => a.t.headers.includes(c)).length || b.t.rows.length - a.t.rows.length);
     return ok[0] || null;
   }
   function availablePresets() {
@@ -1682,18 +1734,18 @@
     while (fm < 1) { fm += 12; fy--; }
     return { from: `${fy}-${p2(fm)}`, to: toM };
   }
-  const monthEnd = ym => { const [y, m] = ym.split('-').map(Number); return `${ym}-${p2(new Date(Date.UTC(y, m, 0)).getUTCDate())}`; };
   const chanCol = p => p.t.headers.find(h => /渠道/.test(h) && !/^月份/.test(h)) || '';
   const isOrderTab = p => isOrderTable(p.t);
-  const isValidTab = p => !isOrderTab(p) && /有效/.test(p.t.name) && !/无效/.test(p.t.name);
+  const isValidTab = p => tableRole(p.t) === 'valid';
   const validityCol = p => p.t.headers.find(h => /是否有效|有效性|判定结果|线索状态|客资状态|有效状态/.test(h)) || '';
-  const isLeadTab = p => !isOrderTab(p) && !isValidTab(p) && !/无效/.test(p.t.name) && (/线索|客资/.test(p.t.name) || !!validityCol(p));
+  const isLeadTab = p => tableRole(p.t) === 'lead' && (/线索|客资/.test(p.t.name) || !!validityCol(p));
   const houseCol = p => p.t.headers.find(h => /房子|房屋/.test(h) && !/^月份/.test(h)) || '';
   function fbRoles(fromYM, toYM) {
     const from = fromYM + '-01', to = monthEnd(toYM);
     const prof = colProfile();
     const ok = p => chanCol(p) && p.t.headers.includes('日期') && p.t.headers.includes('顾问');
-    const score = p => { const i = p.t.headers.indexOf('日期'); return p.t.rows.filter(r => r[i] && r[i] >= from && r[i] <= to).length; };
+    const dc = [{ col: '日期', op: 'between', from, to }];
+    const score = p => p.t.rows.filter(r => rowPass(p.t, r, dc)).length;
     const best = f => prof.filter(p => ok(p) && f(p)).sort((a, b) => (score(b) > 0) - (score(a) > 0) || b.t.time - a.t.time)[0] || null;
     return { from, to, order: best(isOrderTab), lead: best(isLeadTab), valid: best(isValidTab) };
   }
@@ -1742,7 +1794,9 @@
     $('panel').classList.add('open');
     const ps = availablePresets();
     $('presetBtns').innerHTML = ps.length ? ps.map(x => `<button class="btn chip" data-name="${esc(x.name)}" data-g="${esc(x.g)}">${esc(x.name)}<span class="muted">　${esc(x.p.t.name)}</span></button>`).join('') : '<span class="muted">先「⚡ 一键取数」或抓一张明细表，这里会按抓到的列给出快速报表</span>';
-    if (!$('pFrom').value) { const r = lastFullMonths(3); $('pFrom').value = r.from; $('pTo').value = r.to; }
+    { const ro = Object.values(getRaw()).filter(t => t.range && nameRole(t.name) === 'order' && parseRange(t.range)).sort((a, b) => b.time - a.time)[0];
+      const r = ro ? parseRange(ro.range) : (!$('pFrom').value ? lastFullMonths(3) : null);
+      if (r) { $('pFrom').value = r.from; $('pTo').value = r.to; } }
     $('newMsg').textContent = '';
     renderFbBtns();
     $('newBox').style.display = '';
