@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.5.9
+// @version      0.6.0
 // @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -807,7 +807,7 @@
         const pick = (ov && cand.find(t => t.pageKey === ov)) || cand[0];
         ts = pick ? [pick] : [];
         // 按月分组 + 选中的是「无日期列、按范围抓」的表：把其他不重叠的范围表也拼进来（每月各抓一次 → 每月一列）
-        if (pick && pick.noDate && !ov && gb.some(isMonthCol)) {
+        if (pick && pick.noDate && !ov && (gb.some(isMonthCol) || conds.some(f => f.op === 'between'))) {
           const ovl = (x, y) => !(x.to < y.from || y.to < x.from);
           for (const t of cand) if (t !== pick && t.noDate && passRows(t, m).length && ts.every(u => !ovl(u.noDate, t.noDate) && baseOf(u.pageKey) === baseOf(t.pageKey))) ts.push(t);
         }
@@ -1189,6 +1189,66 @@
     };
     return { kind: 'tpl', name: tpl.name, file: `OCQ_${safe}_${stamp()}`, sheets: [sheet], warn: r.warn, used: r.used, emptyWhy: r.emptyWhy, notes: r.notes, pick: r.pick, validRule: tpl.validRule || null, validOptions: tpl.presetKey === 'fb3' ? (tpl.validOptions || []) : null, tplId: tpl.id };
   }
+  // ---------- FB 汇总（一个工作簿三张表） ----------
+  function fbRange() {
+    const st = getSettings(), tp = getTpls();
+    const sel = tp.find(t => t.id === st.tpl && /^fb/.test(t.presetKey || '') && t.range);
+    const any = sel || tp.filter(t => /^fb/.test(t.presetKey || '') && t.range).slice(-1)[0];
+    if (any) { const [a, b] = any.range.split('~'); if (a && b) return { from: a, to: b }; }
+    const ro = Object.values(getRaw()).filter(t => t.range && nameRole(t.name) === 'order' && parseRange(t.range)).sort((a, b) => b.time - a.time)[0];
+    return ro ? parseRange(ro.range) : lastFullMonths(3);
+  }
+  const isFbSel = () => { const st = getSettings(); return st.tpl === '__fbsum' || getTpls().some(t => t.id === st.tpl && /^fb/.test(t.presetKey || '')); };
+  function fbSummaryView(Rg) {
+    Rg = Rg || fbRange();
+    const ps = fbPresets(Rg.from, Rg.to), P = k => ps.find(x => x.key === k);
+    const f1 = P('fb1');
+    if (!f1) throw new Error('还没有可用的成交表（需要带「渠道来源」的成交表，并且范围覆盖所选月份）');
+    const tables = rawTables(getRoster());
+    const orderPk = f1.tpl.metrics[0].table, filters = f1.tpl.filters, rt = rangeText(Rg);
+    const base = computeTemplate({ groupBy: ['顾问'], filters, metrics: [{ src: '成交金额', agg: 'sum', label: '成交金额', fmt: 'money', table: orderPk }, { src: '__rows', agg: 'rows', label: '成单', fmt: 'int', table: orderPk }], calcs: [], total: false, presetKey: 'fbsum' }, tables);
+    const r1 = computeTemplate(f1.tpl, tables);
+    const months = r1.cols.filter(c => c !== '顾问' && c !== '合计');
+    const saved3 = getTpls().find(t => t.presetKey === 'fb3' && t.range === `${Rg.from}~${Rg.to}`);
+    const t3 = saved3 ? regenPreset(saved3) : (P('fb3') && P('fb3').tpl);
+    const r3 = t3 ? computeTemplate(t3, tables) : null;
+    const rateL = '有效客资成单率';
+    const dash = !!(t3 && t3.dash);
+    const by = new Map();
+    const get = n => { if (!by.has(n)) by.set(n, { 顾问: n, 成交金额: 0, 客资: 0, 无效客资: dash ? null : 0, 有效客资: 0, 成单: 0 }); return by.get(n); };
+    for (const r of base.rows) Object.assign(get(r.顾问), { 成交金额: r.成交金额, 成单: r.成单 });
+    if (months.length > 1) for (const r of r1.rows) for (const m of months) get(r.顾问)[`${m}成交`] = r[m] || 0;
+    if (r3) for (const r of r3.rows) Object.assign(get(r.顾问), { 客资: r.客资 || 0, 无效客资: dash ? null : (r.无效客资 || 0), 有效客资: r.有效客资 || 0 });
+    const fin = o => { o[rateL] = dash || !o.有效客资 ? null : o.成单 / o.有效客资; o.客单价 = o.成单 ? o.成交金额 / o.成单 : null; return o; };
+    const rows = [...by.values()].map(fin).sort((a, b) => b.成交金额 - a.成交金额 || b.成单 - a.成单);
+    rows.forEach((r, i) => { r.排名 = i + 1; });
+    const mcols = months.length > 1 ? months.map(m => `${m}成交`) : [];
+    const cols = ['排名', '顾问'].concat(mcols, ['成交金额', '客资', '无效客资', '有效客资', '成单', rateL, '客单价']);
+    const tot = { 排名: '', 顾问: '合计', __sum: true };
+    for (const c of cols.slice(2)) tot[c] = rows.reduce((a, r) => a + (typeof r[c] === 'number' ? r[c] : 0), 0);
+    if (dash) tot.无效客资 = null;
+    fin(tot);
+    const fmt = c => (c === rateL ? 'pct' : /成交|金额|客单价/.test(c) && c !== '成单' ? 'money' : c === '排名' || c === '顾问' ? '' : 'int');
+    const text = (c, v) => fmtT(fmt(c), v);
+    const all = rows.concat([tot]);
+    const note = dash ? t3.dash.hint : !r3 ? `还没有 ${rt}的线索表（客资）：去线索页筛 ${Rg.from}~${Rg.to} 抓一次` : '';
+    const s1 = {
+      sheet: 'FB汇总', title: `FB汇总（${rt}）`, info: `统计范围 ${Rg.from} ~ ${Rg.to} · 渠道含 Facebook · 生成于 ${tm(nowMs())}（UTC+8）`, note,
+      cols, rows, sums: [tot], numFmt: c => XF[fmt(c)] || '@', text, green: c => c === '排名' || c === '顾问' || c === rateL || c === '客单价',
+      red: (c, row) => c === '无效客资' && !row.__sum && typeof row[c] === 'number' && row[c] > 0, up: () => false,
+      width: c => autoWidth(c, all, text), freezeCols: 2
+    };
+    const sheets = [s1];
+    const f2 = P('fb2');
+    if (f2) { const s = templateView(f2.tpl).sheets[0]; sheets.push(Object.assign(s, { sheet: '房子情况', title: `房子情况（${rt}，Facebook）` })); }
+    const hc = houseCol({ t: tables.find(x => x.pageKey === orderPk) || { headers: [] } });
+    if (hc) {
+      const pv = templateView({ name: '顾问×房子情况', groupBy: ['顾问', hc], filters, metrics: [{ src: '__rows', agg: 'rows', label: '单数', fmt: 'int', table: orderPk }], calcs: [], pivot: { col: hc, delta: false }, sort: { col: '合计', dir: 'desc' }, red: {}, total: true, presetKey: 'fbsum' }).sheets[0];
+      sheets.push(Object.assign(pv, { sheet: '顾问×房子情况', title: `顾问×房子情况（${rt}，Facebook，单数）` }));
+    }
+    const lab = Rg.from === Rg.to ? Rg.from : `${Rg.from}~${Rg.to.slice(0, 4) === Rg.from.slice(0, 4) ? Rg.to.slice(5) : Rg.to}`;
+    return { kind: 'fbsum', name: `FB·汇总（${rt}）`, file: `FB分析_${lab}`, sheets, panelSheets: 1, warn: note ? [note] : [], used: [...new Set([].concat(base.used || [], r3 ? r3.used || [] : []))] };
+  }
   const asView = x => (x && x.sheets ? x : rankingView(x));
 
   async function buildWorkbook(view) {
@@ -1209,7 +1269,8 @@
       ws.getRow(1).height = 26;
       ws.mergeCells(2, 1, 2, n);
       ws.getCell(2, 1).value = v.info;
-      ws.getCell(2, 1).font = { name: 'Microsoft YaHei', size: 10, color: { argb: 'FF595959' } };
+      ws.getCell(2, 1).font = { name: 'Microsoft YaHei', size: 10, color: { argb: v.note ? 'FFC55A11' : 'FF595959' }, bold: !!v.note };
+      if (v.note) ws.getCell(2, 1).value = `${v.info}　⚠ ${v.note}`;
       ws.getCell(2, 1).alignment = { horizontal: 'left', vertical: 'middle' };
       ws.getRow(2).height = 18;
       const hr = ws.getRow(3);
@@ -1228,7 +1289,7 @@
         v.cols.forEach((c, j) => {
           const cell = row.getCell(j + 1);
           const val = r[c];
-          cell.value = val == null ? '' : val;
+          cell.value = val === null ? '—' : val == null ? '' : val;
           if (typeof val === 'number') cell.numFmt = fmts[j];
           cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: isSum ? C.sum : v.green(c) ? C.green : C.yellow } };
           const red = v.red(c, r), up = !red && !!(v.up && v.up(c, r));
@@ -1648,6 +1709,7 @@
   }
   function currentView() {
     const st = getSettings();
+    if (st.tpl === '__fbsum') return fbSummaryView();
     let tpl = st.tpl && getTpls().find(t => t.id === st.tpl);
     if (tpl) { tpl = fixBindings(regenPreset(tpl)); return templateView(tpl); }
     return rankingView(computeRanking(getSources(), getRoster(), st));
@@ -1682,10 +1744,12 @@
   function renderTplSel() {
     getTpls().forEach(x => { try { fixBindings(x); } catch (e) {} });
     const st = getSettings(), tp = getTpls();
-    if (st.tpl && !tp.some(t => t.id === st.tpl)) { st.tpl = ''; setSettings(st); }
-    $('tplSel').innerHTML = `<option value="">顾问排行（默认）</option>` + tp.map(t => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join('') + `<option value="__new">＋ 新建报表</option>`;
+    let fbOpt = '';
+    try { const Rg = fbRange(); if (tp.some(t => /^fb/.test(t.presetKey || '')) || fbPresets(Rg.from, Rg.to).length) fbOpt = `<option value="__fbsum">FB·汇总（${esc(rangeText(Rg))}）</option>`; } catch (e) {}
+    if (st.tpl && !tp.some(t => t.id === st.tpl) && !(st.tpl === '__fbsum' && fbOpt)) { st.tpl = ''; setSettings(st); }
+    $('tplSel').innerHTML = `<option value="">顾问排行（默认）</option>` + tp.map(t => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join('') + fbOpt + `<option value="__new">＋ 新建报表</option>`;
     $('tplSel').value = st.tpl || '';
-    $('tplEdit').style.display = st.tpl ? '' : 'none';
+    $('tplEdit').style.display = st.tpl && st.tpl !== '__fbsum' ? '' : 'none';
   }
   function renderRanking() {
     $('status').textContent = statusText();
@@ -1693,7 +1757,7 @@
     try { v = currentView(); } catch (e) { $('rinfo').textContent = dateProgress(); $('warn').textContent = e.message; $('rkwrap').innerHTML = ''; return null; }
     $('rinfo').innerHTML = esc(v.sheets[0].info).replace(/时间进度 ([\d.]+%)/, '时间进度 <b>$1</b>');
     $('warn').textContent = (v.warn || []).join('；');
-    $('rkwrap').innerHTML = v.sheets.map((s, si) => `<table class="rk">${v.sheets.length > 1 || si ? `<caption>${esc(s.title)}</caption>` : ''}<tr>${s.cols.map(c => `<th>${esc(c)}</th>`).join('')}</tr>` +
+    $('rkwrap').innerHTML = (v.panelSheets ? v.sheets.slice(0, v.panelSheets) : v.sheets).map((s, si) => `<table class="rk">${v.sheets.length > 1 || si ? `<caption>${esc(s.title)}</caption>` : ''}<tr>${s.cols.map(c => `<th>${esc(c)}</th>`).join('')}</tr>` +
       (s.rows.length ? s.rows.concat(s.sums).map(r => `<tr>${s.cols.map(c => `<td class="${r.__sum ? 's' : s.green(c) ? 'g' : ''} ${s.red(c, r) ? 'red' : s.up && s.up(c, r) ? 'up' : ''}">${esc(s.text(c, r[c]))}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${s.cols.length}" class="muted">${v.emptyWhy ? esc(v.emptyWhy) + ' <button class="mini" id="regen">重新生成</button>' : '（还没有数据）'}</td></tr>`) + '</table>').join('') +
       (v.used && v.used.length ? `<div class="muted" id="usedLine" style="font-size:11px;margin-top:2px">数据来自：${esc(v.used.join('、'))}${v.validRule ? ' · 无效客资＝' + esc(invText(v.validRule)) + '，有效＝客资−无效' : v.validOptions ? ' · 无效客资：没认出' : ''}` +
         (v.pick && v.pick.cand.length > 1 ? ` <select id="srcPick" style="font-size:11px;max-width:200px"><option value="">换一张表 ▾</option>${v.pick.cand.map(c => `<option value="${esc(c.pk)}">${c.pk === v.pick.cur ? '✓ ' : ''}${esc(c.name)}</option>`).join('')}</select>` : '') + '</div>' : '') +
@@ -2360,8 +2424,10 @@
     const i = +e.target.closest('[data-i]').dataset.i; const ss = getSources();
     ss.splice(i, 1); setSources(ss); renderSources(); renderRanking();
   });
-  $('xlsx').onclick = async () => { const v = renderRanking(); if (!v || !v.sheets[0].rows.length) return alert('还没有数据'); await exportExcel(v); };
-  $('img').onclick = async () => { const v = renderRanking(); if (!v || !v.sheets[0].rows.length) return alert('还没有数据'); $('prog').textContent = await copyImage(v); };
+  // 选中任何 FB 报表时：导出合并工作簿、复制汇总表图片
+  const exportView = () => { let v = renderRanking(); if (v && isFbSel()) { try { v = fbSummaryView(); } catch (e) { alert(e.message); return null; } } return v; };
+  $('xlsx').onclick = async () => { const v = exportView(); if (!v || !v.sheets[0].rows.length) return alert('还没有数据'); await exportExcel(v); };
+  $('img').onclick = async () => { let v = exportView(); if (!v || !v.sheets[0].rows.length) return alert('还没有数据'); if (v.kind === 'fbsum') v = Object.assign({}, v, { sheets: [v.sheets[0]] }); $('prog').textContent = await copyImage(v); };
   function diagInfo() {
     const cut = v => { v = String(v == null ? '' : v); return v.length > 24 ? v.slice(0, 24) + '…' : v; };
     const raw = Object.values(getRaw()), vt = rawTables(getRoster());
@@ -2408,6 +2474,7 @@
   if (job) { host.style.display = 'none'; runWorker(job); }
 
   window.__ocqUS = W.__ocqUS = {
+    fbSummaryView, exportView, buildWorkbook,
     openPanel, doScan, startGrab, startReplay, runReplay, getSources, getSteps, setSteps, computeRanking, getRoster, getSettings,
     parsePaste, num, analyze, exportExcel, drawCanvas, summaryRows, infoLine, timeProgress, redCut, setSettingsForTest: setSettings, findBestTable, rewriteMonthDates, root, isBusy: () => busy, isReplaying: () => replaying, FIXED_COLS,
     getRaw, getTpls, saveTemplate, availablePresets, applyPreset, collapseProg, bestPersonIdx, fbPresets, applyFb, pageRange, parseDate, lastFullMonths, getUI: () => gmGet('ocq_ui', {}), buildPreset, openNewBox, openWizard, importTemplates, computeTemplate, compileFormula, rawTables, currentView, templateView, rankingView, groupRanking, openEditor, setRosterForTest: setRoster, renderAll
