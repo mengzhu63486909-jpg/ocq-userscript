@@ -52,7 +52,7 @@
 
   // ---------------- 基础工具 ----------------
   const norm = s => String(s == null ? '' : s).replace(/\s+/g, '').trim();
-  const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&', '<': '<', '>': '>', '"': '"' }[c]));
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ('&' + { '&': 'amp', '<': 'lt', '>': 'gt', '"': 'quot' }[c] + ';'));
   function num(s) {
     let t = String(s == null ? '' : s).trim();
     if (!t) return null;
