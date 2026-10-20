@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.5.8
+// @version      0.5.9
 // @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -727,6 +727,10 @@
     return { from: `${m[1]}-${m[2]}`, to: m[4] ? `${m[3] || m[1]}-${m[4]}` : `${m[1]}-${m[2]}` };
   }
   const rangeLabel = R => (R.from === R.to ? R.from : `${R.from}~${R.to.slice(0, 4) === R.from.slice(0, 4) ? R.to.slice(5) : R.to}`);
+  /** 表的期间：有范围标签用标签；没有标签一律算本月（不管表里日期是什么） */
+  const curYM = () => { const d = today8(); return `${d.y}-${String(d.m).padStart(2, '0')}`; };
+  const periodOf = t => parseRange(t.range) || { from: curYM(), to: curYM() };
+  const covers = (t, from, to) => { const P = periodOf(t), f = String(from || '').slice(0, 7), e = String(to || '').slice(0, 7); return !((e && P.from > e) || (f && P.to < f)); };
   const rangeText = R => (R.from === R.to ? `${+R.from.slice(5)}月` : `${+R.from.slice(5)}–${+R.to.slice(5)}月`);
   /** 已抓明细表（附加虚拟列：顾问、所属小组、日期、月份、月份(某日期列)） */
   function rawTables(roster) {
@@ -778,10 +782,11 @@
       const ok = t => (m.src === '__rows' || (t.headers.includes(m.src) && (!/金额|收款|未收|合同/.test(m.src) || colHasData(t, m.src)))) && gb.every(g => t.headers.includes(g)) && (!role || tableRole(t) === role);
       const hasDateF = conds.some(f => f.op === 'between');
       const sc = t => (role === 'order' && ORDER_DATE.test(t.dateCol || '') ? 4 : 0) + (passRows(t, m).length ? 8 : 0) + (!hasDateF && !t.range ? 2 : 0);
-      let list = tables.filter(ok);
+      const dF = conds.find(f => f.op === 'between' && (f.col === '日期' || isMonthCol(f.col)));
+      let list = tables.filter(t => ok(t) && (!dF || covers(t, dF.from, dF.to)));
       if (!list.length && role === 'order') {
         // 兜底：放宽为「有成交金额列、不是看位/邀约/线索/无效表」
-        list = tables.filter(t => !/看位|邀约|线索|无效/.test(t.name) && (m.src === '__rows' || t.headers.includes(m.src)) && gb.every(g => t.headers.includes(g)) && t.headers.includes('成交金额'));
+        list = tables.filter(t => (!dF || covers(t, dF.from, dF.to)) && !/看位|邀约|线索|无效/.test(t.name) && (m.src === '__rows' || t.headers.includes(m.src)) && gb.every(g => t.headers.includes(g)) && t.headers.includes('成交金额'));
         if (list.length) warn.push(`没有完全符合的成交表，先用「${list[0].name}」（建议点「高级设置 › 已抓的数据 › 复制诊断信息」发给我）`);
       }
       return list.sort((a, b) => sc(b) - sc(a) || (b.time || 0) - (a.time || 0));
@@ -1000,6 +1005,7 @@
       for (const s of subs) sums.push(Object.assign({}, s, { __sum: true, [gb[0]]: s[gb[0]] + ' 小计', [gb[1]]: '' }));
       if (TOT) { const o = Object.assign({}, TOT); o[gb[0]] = '合计'; gb.slice(1).forEach(h => { o[h] = ''; }); o.__sum = true; sums.push(o); }
     }
+    if (tpl.dash) { for (const r of rows.concat(sums || [])) for (const c of tpl.dash.cols) if (c in r) r[c] = null; if (tpl.dash.hint) warn.unshift(tpl.dash.hint); }
     let outCols = gb.concat(labels);
     if (tpl.colOrder) outCols = gb.concat(tpl.colOrder.filter(c => labels.includes(c)), labels.filter(c => !tpl.colOrder.includes(c)));
     outCols = outCols.filter(c => !(deltas.some(d => d.label === c) && rows.every(r => r[c] === '' || r[c] == null)));
@@ -1156,7 +1162,7 @@
     return { kind: 'rank', name: '顾问排行', file: `OCQ顾问排行_${stamp()}`, sheets: [main, grp], warn: [] };
   }
   function fmtT(f, v) {
-    if (v === null && (f === 'pct' || f === 'pctd')) return '—';
+    if (v === null) return '—';
     if (v == null || v === '') return '';
     if (typeof v !== 'number') return String(v);
     if (f === 'pct') return (v * 100).toFixed(1) + '%';
@@ -1674,6 +1680,7 @@
     return n;
   }
   function renderTplSel() {
+    getTpls().forEach(x => { try { fixBindings(x); } catch (e) {} });
     const st = getSettings(), tp = getTpls();
     if (st.tpl && !tp.some(t => t.id === st.tpl)) { st.tpl = ''; setSettings(st); }
     $('tplSel').innerHTML = `<option value="">顾问排行（默认）</option>` + tp.map(t => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join('') + `<option value="__new">＋ 新建报表</option>`;
@@ -1787,12 +1794,12 @@
   function fbRoles(fromYM, toYM) {
     const from = fromYM + '-01', to = monthEnd(toYM);
     const prof = colProfile();
-    const ok = p => chanCol(p) && p.t.headers.includes('日期') && p.t.headers.includes('顾问');
+    const ok = p => chanCol(p) && p.t.headers.includes('日期') && p.t.headers.includes('顾问') && covers(p.t, fromYM, toYM);
     const dc = [{ col: '日期', op: 'between', from, to }];
     const score = p => p.t.rows.filter(r => rowPass(p.t, r, dc)).length;
     const best = f => prof.filter(p => ok(p) && f(p)).sort((a, b) => (score(b) > 0) - (score(a) > 0) || b.t.time - a.t.time)[0] || null;
     const valid = prof.filter(p => ok(p) && isValidTab(p) && score(p) > 0).sort((a, b) => b.t.time - a.t.time);
-    const inval = prof.filter(p => ok(p) && tableRole(p.t) === 'invalid' && score(p) > 0 && (p.t.range || !p.t.noDate)).sort((a, b) => b.t.time - a.t.time);
+    const inval = prof.filter(p => ok(p) && tableRole(p.t) === 'invalid' && score(p) > 0).sort((a, b) => b.t.time - a.t.time);
     return { from, to, order: best(isOrderTab), lead: best(isLeadTab), valid: valid[0] || null, validAll: valid, invalAll: inval, score };
   }
   function fbConds(R, tabs) {
@@ -1857,8 +1864,12 @@
         }
         var fb3Valid = { rule: vr, options: opts };
         ms.push({ src: '__rows', agg: 'rows', label: '成单', fmt: 'int', table: R.order.t.pageKey });
-        const fbCalcs = vr ? [{ label: '有效客资', formula: '客资-无效客资', fmt: 'int' }, { label: rateName, formula: rate, fmt: 'pct' }] : [{ label: rateName, formula: rate, fmt: 'pct' }];
-        out.push({ key: 'fb3', name: 'FB·客资与成单率', tpl: { name: 'FB·客资与成单率', validRule: fb3Valid.rule, validOptions: fb3Valid.options, groupBy: ['顾问', '月份'], filters: fbConds(R, [R.order, R.lead, fb3Valid.rule && fb3Valid.rule.mode === 'table' ? R.invalAll.find(p => p.t.pageKey === fb3Valid.rule.table) : null]), colOrder: ['客资', '无效客资', '有效客资', '成单', rateName], metrics: ms, calcs: fbCalcs.concat([{ label: '浮动', delta: rateName, formula: '', fmt: 'pctd' }]), sort: { col: '成单', dir: 'desc' }, red: {}, total: true } });
+        if (!vr) { rateName = '有效客资成单率'; rate = '成单/有效客资'; }
+        const fbCalcs = vr ? [{ label: '有效客资', formula: '客资-无效客资', fmt: 'int' }, { label: rateName, formula: rate, fmt: 'pct' }]
+          : [{ label: '无效客资', formula: '0', fmt: 'int' }, { label: '有效客资', formula: '客资', fmt: 'int' }, { label: rateName, formula: rate, fmt: 'pct' }];
+        const rt = rangeText({ from: fromYM, to: toYM }), md = s => `${+s.slice(5, 7)}/${+s.slice(8, 10)}`;
+        var fb3Dash = vr ? null : { cols: ['无效客资', rateName], hint: `还没有 ${rt}的无效数据：去「普定…无效」页筛 ${md(R.from)}–${md(R.to)} 抓一次，或在线索页加出「线索无效通过时间」列再抓` };
+        out.push({ key: 'fb3', name: 'FB·客资与成单率', tpl: { name: 'FB·客资与成单率', validRule: fb3Valid.rule, validOptions: fb3Valid.options, dash: fb3Dash, groupBy: ['顾问', '月份'], filters: fbConds(R, [R.order, R.lead, fb3Valid.rule && fb3Valid.rule.mode === 'table' ? R.invalAll.find(p => p.t.pageKey === fb3Valid.rule.table) : null]), colOrder: ['客资', '无效客资', '有效客资', '成单', rateName], metrics: ms, calcs: fbCalcs.concat([{ label: '浮动', delta: rateName, formula: '', fmt: 'pctd' }]), sort: { col: '成单', dir: 'desc' }, red: {}, total: true } });
       }
     }
     const nameOf = pk => (colProfile().find(p => p.t.pageKey === pk) || { t: { name: pk } }).t.name;
