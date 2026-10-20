@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.5.0
+// @version      0.5.1
 // @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -1400,7 +1400,7 @@
   /** 这页筛的是哪段时间：先看页面上的日期框/网址，再看表里的日期列 */
   function pageRange(parsed) {
     let ds = [...String(location.href).matchAll(/(\d{4})-(\d{2})-(\d{2})/g)].map(m => m[0]);
-    document.querySelectorAll('input').forEach(i => { const d = parseDate(i.value); if (d && visible(i)) ds.push(d); });
+    document.querySelectorAll('input').forEach(i => { if (!visible(i)) return; for (const m of String(i.value || '').matchAll(/\d{4}\s*[-/.年]\s*\d{1,2}\s*[-/.月]\s*\d{1,2}/g)) { const d = parseDate(m[0]); if (d) ds.push(d); } });
     let src = 'filter';
     if (!ds.length && parsed) {
       src = 'data';
