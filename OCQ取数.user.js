@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.5.2
+// @version      0.5.3
 // @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -633,7 +633,7 @@
     return `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
   }
   const ymOf = s => { const d = parseDate(s); return d ? d.slice(0, 7) : ''; };
-  const DATE_PRI = [/成交|签约|下单|订单/, /创建|录入|分配|登记|进线|获客/, /日期/, /时间/];
+  const DATE_PRI = [/成交时间|成交日期|签约/, /成交|签约|下单|订单/, /创建|录入|分配|登记|进线|获客/, /日期/, /时间/];
   function detectDateCols(headers, rows) {
     const out = [];
     headers.forEach((h, i) => {
@@ -644,7 +644,7 @@
     return out;
   }
   function primaryDate(headers, idxs) {
-    for (const re of DATE_PRI) { const i = idxs.find(i => re.test(headers[i])); if (i != null) return i; }
+    for (const re of DATE_PRI) { const i = idxs.find(i => re.test(headers[i]) && !/接单/.test(headers[i])); if (i != null) return i; }
     return idxs.length ? idxs[0] : -1;
   }
   const lc = s => String(s == null ? '' : s).replace(/\s+/g, '').toLowerCase();
@@ -706,13 +706,27 @@
     const warn = [];
     const conds = activeConds(tpl.filters);
     const missCond = new Set();
+    const usedNames = new Set();
+    const baseOf = pk => String(pk || '').split('·')[0];
+    const roleOf = t => (t.headers.includes('成交金额') ? 'order' : /有效/.test(t.name) && !/无效/.test(t.name) ? 'valid' : 'lead');
+    const passRows = (t, m) => t.rows.filter(r => rowPass(t, r, conds) && rowPass(t, r, activeConds(m.where)));
     const plan = metrics.map(m => {
-      const ts = tables.filter(t => (m.src === '__rows' || t.headers.includes(m.src)) && gb.every(g => t.headers.includes(g)) && (!m.table || t.pageKey === m.table || !tables.some(x => x.pageKey === m.table)));
+      const fits = t => (m.src === '__rows' || t.headers.includes(m.src)) && gb.every(g => t.headers.includes(g));
+      let ts;
+      if (m.table || tpl.presetKey) {
+        // 按「角色 + 列名」绑定：不认死某张表；几张都合适时用最近抓的（优先有数据的）
+        const bt = tables.find(t => t.pageKey === m.table) || tables.find(t => baseOf(t.pageKey) === baseOf(m.table));
+        const role = m.role || (bt ? roleOf(bt) : '');
+        const cand = tables.filter(t => fits(t) && (!role || roleOf(t) === role)).sort((a, b) => (b.time || 0) - (a.time || 0));
+        const pick = cand.find(t => passRows(t, m).length) || cand[0];
+        ts = pick ? [pick] : [];
+      } else ts = tables.filter(fits);
+      ts.forEach(t => usedNames.add(t.name));
       if (!ts.length) warn.push(`「${m.label}」：还没有同时带「${m.src}」和「${gb.join('、')}」的已抓表`);
       return {
         m, ts: ts.map(t => {
           conds.filter(f => !t.headers.includes(f.col)).forEach(f => missCond.add(`「${t.name}」没有「${f.col}」列，这个条件没用在它上面`));
-          const rows = t.rows.filter(r => rowPass(t, r, conds) && rowPass(t, r, activeConds(m.where)));
+          const rows = passRows(t, m);
           return { t, rows, si: m.src === '__rows' ? -1 : t.headers.indexOf(m.src), gi: gb.map(g => t.headers.indexOf(g)) };
         })
       };
@@ -770,6 +784,24 @@
     };
     const cmp = cmpBy(sc, dir);
     let rows = build(ALL).map(finish);
+    let emptyWhy = '';
+    if (!rows.length) {
+      const p0 = plan.find(x => x.ts.length);
+      if (!p0) emptyWhy = warn[0] || '还没有合适的已抓表';
+      else {
+        const T = p0.ts[0].t, nd = conds.filter(f => f.op !== 'between'), dcs = conds.filter(f => f.op === 'between');
+        const r1 = T.rows.filter(r => rowPass(T, r, nd));
+        const what = nd.map(f => f.value).join('、');
+        if (!T.rows.length) emptyWhy = `「${T.name}」是空表`;
+        else if (!r1.length) emptyWhy = `「${T.name}」里没有${nd.map(f => `${f.col}含「${f.value}」`).join('、')}的行`;
+        else if (dcs.length) {
+          const f = dcs[0], col = f.col === '日期' && T.dateCol ? T.dateCol : f.col, ci = T.headers.indexOf(f.col);
+          const ds = r1.map(r => parseDate(r[ci]) || (/^\d{4}-\d{2}$/.test(r[ci]) ? r[ci] : '')).filter(Boolean).sort();
+          const ymr = (a, b) => `${(a || '').slice(0, 7)} ~ ${(b || '').slice(0, 7)}`;
+          emptyWhy = `${what ? `筛完 ${what} 后，` : ''}${ymr(f.from, f.to)} 没有${col}在范围内的行；` + (ds.length ? `数据里的${col}是 ${ymr(ds[0], ds[ds.length - 1])}` : `数据里的${col}都是空的或认不出日期`);
+        } else emptyWhy = `「${T.name}」筛完条件后没有行`;
+      }
+    }
     if (tpl.mergeSmall && gb.length === 1 && rows.length > 1) {
       const key = sc && typeof rows[0][sc] === 'number' ? sc : (metrics[0] && metrics[0].label);
       const tot = TOT ? TOT[key] : 0;
@@ -837,7 +869,7 @@
         withDelta(o);
         sums.push(o);
       }
-      return { cols, rows: prow, sums, warn, fmt: pfmt, groupCols: rowGb, calcLabels: [], deltaCols: dcol };
+      return { cols, rows: prow, sums, warn, used: [...usedNames], emptyWhy, fmt: pfmt, groupCols: rowGb, calcLabels: [], deltaCols: dcol };
     }
 
     let subs = [];
@@ -853,7 +885,7 @@
       for (const s of subs) sums.push(Object.assign({}, s, { __sum: true, [gb[0]]: s[gb[0]] + ' 小计', [gb[1]]: '' }));
       if (TOT) { const o = Object.assign({}, TOT); o[gb[0]] = '合计'; gb.slice(1).forEach(h => { o[h] = ''; }); o.__sum = true; sums.push(o); }
     }
-    return { cols: gb.concat(labels), rows, sums, warn, fmt, groupCols: gb, calcLabels: calcs.filter(c => !c.delta).map(c => c.label), deltaCols: deltas.map(c => c.label) };
+    return { cols: gb.concat(labels), rows, sums, warn, used: [...usedNames], emptyWhy, fmt, groupCols: gb, calcLabels: calcs.filter(c => !c.delta).map(c => c.label), deltaCols: deltas.map(c => c.label) };
   }
 
   // ---------------- 排行 ----------------
@@ -1029,7 +1061,7 @@
       up: (c, row) => r.deltaCols.includes(c) && typeof row[c] === 'number' && row[c] > 1e-12,
       width: c => autoWidth(c, all, text), freezeCols: r.groupCols.length
     };
-    return { kind: 'tpl', name: tpl.name, file: `OCQ_${safe}_${stamp()}`, sheets: [sheet], warn: r.warn };
+    return { kind: 'tpl', name: tpl.name, file: `OCQ_${safe}_${stamp()}`, sheets: [sheet], warn: r.warn, used: r.used, emptyWhy: r.emptyWhy, tplId: tpl.id };
   }
   const asView = x => (x && x.sheets ? x : rankingView(x));
 
@@ -1490,9 +1522,21 @@
   }
   function currentView() {
     const st = getSettings();
-    const tpl = st.tpl && getTpls().find(t => t.id === st.tpl);
-    if (tpl) return templateView(tpl);
+    let tpl = st.tpl && getTpls().find(t => t.id === st.tpl);
+    if (tpl) { tpl = regenPreset(tpl); return templateView(tpl); }
     return rankingView(computeRanking(getSources(), getRoster(), st));
+  }
+  /** 预设报表：每次打开按当前已抓数据重新生成配置（只保留名字、id、日期范围） */
+  function regenPreset(tpl, force) {
+    if (!tpl.presetKey || !/^fb/.test(tpl.presetKey) || !tpl.range) return tpl;
+    const [from, to] = String(tpl.range).split('~');
+    if (!from || !to) return tpl;
+    let x = null;
+    try { x = fbPresets(from, to).find(p => p.key === tpl.presetKey); } catch (e) { x = null; }
+    if (!x) return tpl;
+    const n = Object.assign({}, tpl, x.tpl, { id: tpl.id, name: tpl.name });
+    if (force || JSON.stringify(n) !== JSON.stringify(tpl)) { const tp = getTpls(), i = tp.findIndex(y => y.id === tpl.id); if (i >= 0) { tp[i] = n; setTpls(tp); } }
+    return n;
   }
   function renderTplSel() {
     const st = getSettings(), tp = getTpls();
@@ -1508,7 +1552,10 @@
     $('rinfo').innerHTML = esc(v.sheets[0].info).replace(/时间进度 ([\d.]+%)/, '时间进度 <b>$1</b>');
     $('warn').textContent = (v.warn || []).join('；');
     $('rkwrap').innerHTML = v.sheets.map((s, si) => `<table class="rk">${v.sheets.length > 1 || si ? `<caption>${esc(s.title)}</caption>` : ''}<tr>${s.cols.map(c => `<th>${esc(c)}</th>`).join('')}</tr>` +
-      (s.rows.length ? s.rows.concat(s.sums).map(r => `<tr>${s.cols.map(c => `<td class="${r.__sum ? 's' : s.green(c) ? 'g' : ''} ${s.red(c, r) ? 'red' : s.up && s.up(c, r) ? 'up' : ''}">${esc(s.text(c, r[c]))}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${s.cols.length}" class="muted">（还没有数据）</td></tr>`) + '</table>').join('');
+      (s.rows.length ? s.rows.concat(s.sums).map(r => `<tr>${s.cols.map(c => `<td class="${r.__sum ? 's' : s.green(c) ? 'g' : ''} ${s.red(c, r) ? 'red' : s.up && s.up(c, r) ? 'up' : ''}">${esc(s.text(c, r[c]))}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${s.cols.length}" class="muted">${v.emptyWhy ? esc(v.emptyWhy) + ' <button class="mini" id="regen">重新生成</button>' : '（还没有数据）'}</td></tr>`) + '</table>').join('') +
+      (v.used && v.used.length ? `<div class="muted" id="usedLine" style="font-size:11px;margin-top:2px">数据来自：${esc(v.used.join('、'))}</div>` : '');
+    const rg = $('regen');
+    if (rg) rg.onclick = () => { const t = getTpls().find(x => x.id === v.tplId); if (!t) return; if (t.presetKey) { regenPreset(t, true); renderRanking(); } else openWizard(t); };
     $('log').textContent = getLog().slice().reverse().join('\n');
     return v;
   }
