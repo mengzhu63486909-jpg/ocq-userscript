@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.6.0
+// @version      0.6.1
 // @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -592,6 +592,45 @@
     }
     return { headers: hs, rows: out };
   }
+  /** 从已存明细表生成顾问排行用的来源（成交额/成单等） */
+  function sourcesFromRaw(t) {
+    if (!t || !t.headers || !t.rows) return [];
+    const headers = t.headers, rows = t.rows;
+    let nameIdx = t.nameHeader ? headers.indexOf(hnorm(t.nameHeader) || t.nameHeader) : -1;
+    if (nameIdx < 0) nameIdx = headers.indexOf('沟通负责人');
+    if (nameIdx < 0 || personScore(rows, nameIdx, headers[nameIdx]) <= 0.5) nameIdx = bestPersonIdx(headers, rows, nameIdx);
+    if (nameIdx < 0) return [];
+    const picked = [];
+    const moneyIdx = headers.findIndex(h => h === '成交金额');
+    const bdIdx = headers.findIndex(h => h === '变动金额');
+    if (moneyIdx >= 0) {
+      picked.push({ idx: moneyIdx, key: '成交金额#1', header: '成交金额', display: '成交金额', mode: 'sum', label: '成交额(元)' });
+      picked.push({ idx: nameIdx, key: headers[nameIdx] + '#nm', header: headers[nameIdx], display: headers[nameIdx], mode: 'count', label: '成单' });
+    }
+    if (bdIdx >= 0) picked.push({ idx: bdIdx, key: '变动金额#1', header: '变动金额', display: '变动金额', mode: 'sum', label: '变动金额(元)' });
+    if (!picked.length) {
+      const f = pageCountField(t.name || t.pageKey || '');
+      if (f) picked.push({ idx: nameIdx, key: headers[nameIdx] + '#nm', header: headers[nameIdx], display: headers[nameIdx], mode: 'count', label: f });
+    }
+    if (!picked.length) return [];
+    const fake = { headers, rows, total: rows.length };
+    return buildSources(fake, nameIdx, picked, t.pageKey || t.name, '', null).sources.map(s => Object.assign(s, { time: t.time || Date.now(), pageName: t.name }));
+  }
+  /** 用某张已抓明细直接刷新顾问排行，并切到默认排行视图 */
+  function applyRawToRanking(pk) {
+    const t = getRaw()[pk];
+    if (!t) return '找不到这份数据';
+    const src = sourcesFromRaw(t);
+    if (!src.length) return '这张表没有成交金额/可计数列，出不了顾问排行';
+    const msgs = upsertSources(src);
+    const st = getSettings();
+    st.tpl = '';
+    st.rankPeriod = t.range || '';
+    setSettings(st);
+    renderTplSel(); renderSources(); renderRanking();
+    return `已用「${t.name || pk}」更新顾问排行` + (t.range ? `（${rangeText(parseRange(t.range) || { from: t.range, to: t.range })}）` : '') + (msgs.length ? '；' + msgs.join('；') : '');
+  }
+
   function storeRaw(pk, name, res, nameIdx, range) {
     const c = cleanRaw(res.headers, res.rows, nameIdx);
     const raw = getRaw();
@@ -1063,7 +1102,8 @@
   function infoLine(st) {
     const t = today8(), p2 = n => String(n).padStart(2, '0');
     const tp = (timeProgress() * 100).toFixed(1) + '%';
-    return `统计日期 ${t.y}-${p2(t.m)}-${p2(t.d)}，时间进度 ${tp}，` + (st.redMode === 'fixed' ? `月完成率低于 ${num(st.threshold) || 80}% 标红` : '月完成率低于时间进度标红');
+    const period = st.rankPeriod && parseRange(st.rankPeriod) ? `统计期间 ${rangeText(parseRange(st.rankPeriod))}，` : '';
+    return `${period}统计日期 ${t.y}-${p2(t.m)}-${p2(t.d)}，时间进度 ${tp}，` + (st.redMode === 'fixed' ? `月完成率低于 ${num(st.threshold) || 80}% 标红` : '月完成率低于时间进度标红');
   }
   function dateProgress() {
     const t = today8(), p2 = n => String(n).padStart(2, '0');
@@ -1643,7 +1683,12 @@
     if (!ds.length && parsed) {
       src = 'data';
       const dc = detectDateCols(parsed.headers, parsed.rows);
-      const pd = primaryDate(parsed.headers, dc);
+      let pd = primaryDate(parsed.headers, dc);
+      // 成交表只用成交时间估期间，避免「预计开工」把十月单误判成本月
+      if (parsed.headers.includes('成交金额')) {
+        const oi = dc.find(i => /成交时间|成交日期|签约/.test(parsed.headers[i]));
+        if (oi != null) pd = oi;
+      }
       if (pd >= 0) ds = parsed.rows.map(r => parseDate(r[pd])).filter(Boolean);
     }
     if (!ds.length) return { hist: false, tag: '' };
@@ -1694,7 +1739,7 @@
     $('stepCnt').textContent = st.length ? `（${st.length} 步）` : '';
     $('steps').innerHTML = st.length ? st.map((s, i) => { const n = stepCount(s); return `<div data-i="${i}"><span class="nm" title="${esc(s.url)}">${esc(s.name)}<span class="muted">${n != null ? ` · ${n} 条` : ' · 还没抓'}</span></span><button class="mini" data-a="del" title="删除这一步">×</button></div>`; }).join('') : '<span class="muted">（还没有：打开一张明细表，点「抓当前这张表」）</span>';
     const hist = Object.values(getRaw()).filter(r => r.range && !st.some(s => s.pageKey === r.pageKey));
-    if (hist.length) $('steps').innerHTML += '<div class="muted" style="border:none">历史数据（不参加每日取数）：</div>' + hist.map(r => `<div data-raw="${esc(r.pageKey)}"><span class="nm">${esc(r.pageKey)}<span class="muted"> · ${r.rows.length} 条</span></span><button class="mini" data-a="rmraw" title="删除这份历史数据">×</button></div>`).join('');
+    if (hist.length) $('steps').innerHTML += '<div class="muted" style="border:none">历史数据（点「出排行」可直接做顾问排行）：</div>' + hist.map(r => `<div data-raw="${esc(r.pageKey)}"><span class="nm">${esc(r.pageKey)}<span class="muted"> · ${r.rows.length} 条</span></span>${nameRole(r.name) === 'order' || (r.headers || []).includes('成交金额') ? '<button class="mini" data-a="rankraw" title="用这份数据出顾问排行">出排行</button>' : ''}<button class="mini" data-a="rmraw" title="删除这份历史数据">×</button></div>`).join('');
   }
   function renderSources() {
     const ss = getSources();
@@ -1712,6 +1757,17 @@
     if (st.tpl === '__fbsum') return fbSummaryView();
     let tpl = st.tpl && getTpls().find(t => t.id === st.tpl);
     if (tpl) { tpl = fixBindings(regenPreset(tpl)); return templateView(tpl); }
+    // 顾问排行缺成交额时，自动用最近一张成交明细补上（解决历史抓取没写入排行来源）
+    if (!getSources().some(s => s.label === '成交额(元)')) {
+      const orders = Object.values(getRaw()).filter(t => nameRole(t.name) === 'order' || (t.headers || []).includes('成交金额')).sort((a, b) => (b.time || 0) - (a.time || 0));
+      if (orders.length) {
+        const src = sourcesFromRaw(orders[0]);
+        if (src.length) {
+          upsertSources(src);
+          if (!st.rankPeriod && orders[0].range) { st.rankPeriod = orders[0].range; setSettings(st); }
+        }
+      }
+    }
     return rankingView(computeRanking(getSources(), getRoster(), st));
   }
   /** 预设报表：每次打开按当前已抓数据重新生成配置（只保留名字、id、日期范围） */
@@ -2359,13 +2415,28 @@
       const step = addStep ? saveStepFrom(nameIdx, picked) : null;
       const key = histOnly ? `${pageKey()}·${rg.tag}` : pageKey();
       const nraw = storeRaw(key, step ? step.name : key, res, nameIdx, rg.tag);
+      // 历史抓取也写入顾问排行来源：否则「不勾加入步骤」时排行一直是 0
       const built = buildSources(res, nameIdx, picked, pageKey(), location.href, step ? step.id : null);
-      const msgs = histOnly ? [] : upsertSources(built.sources);
+      let msgs = upsertSources(built.sources);
+      // 没勾选成交列时，用刚存的明细兜底生成成交额/成单
+      if (!built.sources.some(s => s.label === '成交额(元)' || s.label === '成单')) {
+        const rawT = getRaw()[key];
+        const fb = sourcesFromRaw(rawT);
+        if (fb.length) msgs = msgs.concat(upsertSources(fb));
+      }
       const head = `【${pageKey()}】${res.pages} 页，${res.collected}${res.total != null ? '/' + res.total : ''} 条（明细 ${nraw} 行已存）` + (res.incomplete ? `  ⚠ 只抓到 ${res.collected}/${res.total} 条，可能没翻完页` : '');
       addLog([head].concat(built.lines).join('\n') + (msgs.length ? '\n   ' + msgs.join('；') : ''));
       const fcBad = built.sources.some(s => s.footer && !s.footer.ok);
-      $('prog').textContent = (res.incomplete ? `⚠ 只抓到 ${res.collected}/${res.total} 条` : (histOnly ? `✅ 抓好了：${nraw} 条，存为「${key}」（历史数据，不加入每日取数）` : step ? `✅ 抓好了：${nraw} 条，已记进取数步骤` : `✅ 抓好了：${nraw} 条（没加入每日取数）`)) + (fcBad ? '\n⚠ 和页面合计对不上，详见「更多 › 清空 / 记录」' : '');
-      W.__ocqLastResult = { res: { pages: res.pages, collected: res.collected, total: res.total, incomplete: res.incomplete }, lines: built.lines, msgs, nraw };
+      const hasOrder = getSources().some(s => s.label === '成交额(元)' || s.label === '成单');
+      if (hasOrder) {
+        const st = getSettings();
+        st.tpl = '';
+        st.rankPeriod = rg.tag || '';
+        setSettings(st);
+      }
+      const periodTip = rg.tag ? `，已更新顾问排行（${rangeText(parseRange(rg.tag) || { from: rg.tag, to: rg.tag })}）` : (hasOrder ? '，已更新顾问排行' : '');
+      $('prog').textContent = (res.incomplete ? `⚠ 只抓到 ${res.collected}/${res.total} 条` : (histOnly ? `✅ 抓好了：${nraw} 条，存为「${key}」` : step ? `✅ 抓好了：${nraw} 条，已记进取数步骤` : `✅ 抓好了：${nraw} 条`)) + periodTip + (fcBad ? '\n⚠ 和页面合计对不上，详见「更多 › 清空 / 记录」' : '');
+      W.__ocqLastResult = { res: { pages: res.pages, collected: res.collected, total: res.total, incomplete: res.incomplete }, lines: built.lines, msgs, nraw, key, histOnly };
       renderAll(); doScan();
     } catch (e) {
       $('prog').textContent = '出错：' + e.message;
@@ -2407,6 +2478,7 @@
   $('go').onclick = startGrab;
   $('steps').addEventListener('click', e => {
     const a = e.target.dataset.a; if (!a) return;
+    if (a === 'rankraw') { const k = e.target.closest('[data-raw]').dataset.raw; $('prog').textContent = applyRawToRanking(k); return; }
     if (a === 'rmraw') { const k = e.target.closest('[data-raw]').dataset.raw; if (!confirm(`删除历史数据「${k}」？`)) return; const r = getRaw(); delete r[k]; setRaw(r); renderAll(); return; }
     const i = +e.target.closest('[data-i]').dataset.i; const st = getSteps();
     if (a === 'up' && i > 0) [st[i - 1], st[i]] = [st[i], st[i - 1]];
@@ -2477,6 +2549,6 @@
     fbSummaryView, exportView, buildWorkbook,
     openPanel, doScan, startGrab, startReplay, runReplay, getSources, getSteps, setSteps, computeRanking, getRoster, getSettings,
     parsePaste, num, analyze, exportExcel, drawCanvas, summaryRows, infoLine, timeProgress, redCut, setSettingsForTest: setSettings, findBestTable, rewriteMonthDates, root, isBusy: () => busy, isReplaying: () => replaying, FIXED_COLS,
-    getRaw, getTpls, saveTemplate, availablePresets, applyPreset, collapseProg, bestPersonIdx, fbPresets, applyFb, pageRange, parseDate, lastFullMonths, getUI: () => gmGet('ocq_ui', {}), buildPreset, openNewBox, openWizard, importTemplates, computeTemplate, compileFormula, rawTables, currentView, templateView, rankingView, groupRanking, openEditor, setRosterForTest: setRoster, renderAll
+    getRaw, sourcesFromRaw, applyRawToRanking, getTpls, saveTemplate, availablePresets, applyPreset, collapseProg, bestPersonIdx, fbPresets, applyFb, pageRange, parseDate, lastFullMonths, getUI: () => gmGet('ocq_ui', {}), buildPreset, openNewBox, openWizard, importTemplates, computeTemplate, compileFormula, rawTables, currentView, templateView, rankingView, groupRanking, openEditor, setRosterForTest: setRoster, renderAll
   };
 })();
