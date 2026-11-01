@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.6.1
+// @version      0.6.2
 // @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -24,6 +24,7 @@
 
   const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
   const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const SCRIPT_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.6.2';
 
   // ---------------- 存储 ----------------
   const gmGet = (k, d) => {
@@ -1556,7 +1557,7 @@
   .panel{position:fixed;top:0;right:-680px;width:660px;max-width:97vw;height:100vh;background:#fff;box-shadow:-4px 0 20px rgba(0,0,0,.25);transition:right .25s;display:flex;flex-direction:column;font-size:13px;color:#222}
   .panel.open{right:0}
   .hd{padding:10px 14px;background:#ff6a00;color:#fff;display:flex;align-items:center;gap:8px}
-  .hd b{font-size:15px}.hd .sp{flex:1}.hd button{background:none;border:none;color:#fff;font-size:20px;cursor:pointer}
+  .hd b{font-size:15px}.hd .ver{font-size:12px;opacity:.9;font-weight:normal;margin-left:2px}.hd .sp{flex:1}.hd button{background:none;border:none;color:#fff;font-size:20px;cursor:pointer}
   .hd .hbtn{font-size:12px;border:1px solid #fff;border-radius:4px;padding:3px 9px}.hd select{padding:3px 6px;border-radius:4px;border:none;font-size:13px;max-width:240px}
   .bd{flex:1;overflow:auto;padding:10px 14px}
   .info{background:#fff7ef;border-radius:6px;padding:8px 10px;margin-bottom:8px}.info b{color:#c55a00}
@@ -1598,7 +1599,7 @@
   </style>
   <button class="fab" id="fab" title="OCQ取数">OCQ</button>
   <div class="panel" id="panel">
-    <div class="hd"><b>OCQ取数</b><select id="tplSel" title="选择报表"></select><button class="hbtn" id="tplEdit" style="display:none" title="修改这个报表">编辑</button><span class="sp"></span><button id="close" title="关闭">×</button></div>
+    <div class="hd"><b>OCQ取数</b><span class="ver" id="verLabel"></span><select id="tplSel" title="选择报表"></select><button class="hbtn" id="tplEdit" style="display:none" title="修改这个报表">编辑</button><span class="sp"></span><button id="close" title="关闭">×</button></div>
     <div class="bd">
       <div class="info"><div id="rinfo"></div><div class="muted" id="status"></div></div>
       <div class="big">
@@ -2467,6 +2468,8 @@
   }
 
   function openPanel() { $('panel').classList.add('open'); doScan(); renderAll(); }
+  $('verLabel').textContent = 'v' + SCRIPT_VER;
+  $('fab').title = 'OCQ取数 v' + SCRIPT_VER;
   $('fab').onclick = () => ($('panel').classList.contains('open') ? $('panel').classList.remove('open') : openPanel());
   $('replay').onclick = startReplay;
   $('close').onclick = () => $('panel').classList.remove('open');
@@ -2504,7 +2507,7 @@
     const cut = v => { v = String(v == null ? '' : v); return v.length > 24 ? v.slice(0, 24) + '…' : v; };
     const raw = Object.values(getRaw()), vt = rawTables(getRoster());
     return {
-      version: (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '', time: new Date().toISOString(),
+      version: SCRIPT_VER, time: new Date().toISOString(),
       sources: getSources().map(s => ({ label: s.label, page: s.pageName || s.pageKey || '', people: Object.keys(s.data || {}).length })),
       raw: raw.map(t => {
         const v = vt.find(x => x.pageKey === t.pageKey) || { headers: [] };
