@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.6.2
+// @version      0.6.3
 // @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -24,7 +24,7 @@
 
   const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const SCRIPT_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.6.2';
+  const SCRIPT_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.6.3';
 
   // ---------------- 存储 ----------------
   const gmGet = (k, d) => {
@@ -593,10 +593,35 @@
     }
     return { headers: hs, rows: out };
   }
-  /** 从已存明细表生成顾问排行用的来源（成交额/成单等） */
-  function sourcesFromRaw(t) {
+  const isOrderRaw = t => !!(t && (t.headers || []).includes('成交金额') && !/看位|邀约|线索|无效|变动/.test(String(t.name || '').split('·')[0]));
+  const isChangeRaw = t => !!(t && (t.headers || []).includes('变动金额') && (/变动/.test(String(t.name || '')) || !(t.headers || []).includes('成交金额')));
+  function rawDateIdx(headers, preferChange) {
+    const hs = headers || [];
+    if (preferChange) {
+      let i = hs.findIndex(h => /变动日期/.test(h)); if (i >= 0) return i;
+      i = hs.findIndex(h => /创建时间/.test(h)); if (i >= 0) return i;
+    }
+    let i = hs.findIndex(h => /成交时间|成交日期|签约/.test(h)); if (i >= 0) return i;
+    i = hs.findIndex(h => /变动日期|创建时间|接单日期/.test(h)); return i;
+  }
+  function filterRawByPeriod(t, periodTag, preferChange) {
+    const R = parseRange(periodTag || '');
+    if (!t || !R) return t ? t.rows : [];
+    // 表自身范围标签已覆盖该段 → 整表可用
+    const own = parseRange(t.range || '');
+    if (own && !(own.to < R.from || own.from > R.to)) return t.rows;
+    const di = rawDateIdx(t.headers, preferChange);
+    if (di < 0) return own ? [] : t.rows; // 无日期又对不上标签：无标签表先原样用，有其它标签则不用
+    const a = R.from + '-01', b = monthEnd(R.to);
+    return t.rows.filter(r => { const d = parseDate(r[di]); return d && d >= a && d <= b; });
+  }
+  /** 从已存明细表生成顾问排行用的来源（成交额/成单/变动金额）；periodTag 时按日期过滤 */
+  function sourcesFromRaw(t, periodTag, onlyLabels) {
     if (!t || !t.headers || !t.rows) return [];
-    const headers = t.headers, rows = t.rows;
+    const headers = t.headers;
+    const preferChange = isChangeRaw(t) || (onlyLabels && onlyLabels.includes('变动金额(元)'));
+    const rows = periodTag ? filterRawByPeriod(t, periodTag, preferChange) : t.rows;
+    if (!rows.length) return [];
     let nameIdx = t.nameHeader ? headers.indexOf(hnorm(t.nameHeader) || t.nameHeader) : -1;
     if (nameIdx < 0) nameIdx = headers.indexOf('沟通负责人');
     if (nameIdx < 0 || personScore(rows, nameIdx, headers[nameIdx]) <= 0.5) nameIdx = bestPersonIdx(headers, rows, nameIdx);
@@ -604,32 +629,85 @@
     const picked = [];
     const moneyIdx = headers.findIndex(h => h === '成交金额');
     const bdIdx = headers.findIndex(h => h === '变动金额');
-    if (moneyIdx >= 0) {
+    const want = lab => !onlyLabels || onlyLabels.includes(lab);
+    if (moneyIdx >= 0 && want('成交额(元)')) {
       picked.push({ idx: moneyIdx, key: '成交金额#1', header: '成交金额', display: '成交金额', mode: 'sum', label: '成交额(元)' });
-      picked.push({ idx: nameIdx, key: headers[nameIdx] + '#nm', header: headers[nameIdx], display: headers[nameIdx], mode: 'count', label: '成单' });
+      if (want('成单')) picked.push({ idx: nameIdx, key: headers[nameIdx] + '#nm', header: headers[nameIdx], display: headers[nameIdx], mode: 'count', label: '成单' });
     }
-    if (bdIdx >= 0) picked.push({ idx: bdIdx, key: '变动金额#1', header: '变动金额', display: '变动金额', mode: 'sum', label: '变动金额(元)' });
-    if (!picked.length) {
+    if (bdIdx >= 0 && want('变动金额(元)')) picked.push({ idx: bdIdx, key: '变动金额#1', header: '变动金额', display: '变动金额', mode: 'sum', label: '变动金额(元)' });
+    if (!picked.length && !onlyLabels) {
       const f = pageCountField(t.name || t.pageKey || '');
       if (f) picked.push({ idx: nameIdx, key: headers[nameIdx] + '#nm', header: headers[nameIdx], display: headers[nameIdx], mode: 'count', label: f });
     }
     if (!picked.length) return [];
     const fake = { headers, rows, total: rows.length };
-    return buildSources(fake, nameIdx, picked, t.pageKey || t.name, '', null).sources.map(s => Object.assign(s, { time: t.time || Date.now(), pageName: t.name }));
+    // 来源 id 带期间，避免十月变动被十一月本月表覆盖后找不到
+    const pk = (t.pageKey || t.name) + (periodTag ? '·' + periodTag : (t.range ? '·' + t.range : ''));
+    return buildSources(fake, nameIdx, picked, pk, '', null).sources.map(s => Object.assign(s, { time: t.time || Date.now(), pageName: t.name, range: periodTag || t.range || '' }));
+  }
+  function pickRawForMetric(kind, periodTag) {
+    const all = Object.values(getRaw()).filter(t => kind === 'order' ? isOrderRaw(t) : isChangeRaw(t) || (kind === 'change' && (t.headers || []).includes('变动金额')));
+    const scored = all.map(t => {
+      const own = parseRange(t.range || '');
+      const R = parseRange(periodTag || '');
+      let sc = (t.time || 0) / 1e13;
+      if (kind === 'change' && /变动/.test(t.name || '')) sc += 5;
+      if (R && own && !(own.to < R.from || own.from > R.to)) sc += 20;
+      if (R && !own && filterRawByPeriod(t, periodTag, kind === 'change').length) sc += 10;
+      if (!R && !own) sc += 8; // 本月无标签
+      if (R && own && (own.from !== R.from || own.to !== R.to) && !(own.to < R.from || own.from > R.to)) sc += 5;
+      return { t, sc, n: filterRawByPeriod(t, periodTag || t.range || '', kind === 'change').length };
+    }).filter(x => !periodTag || x.n || parseRange(x.t.range || ''));
+    scored.sort((a, b) => b.sc - a.sc || b.n - a.n);
+    return scored.length ? scored[0].t : null;
+  }
+  /** 按统计期间从明细补成交额/成单/变动金额（缺哪补哪） */
+  function syncRankingMetrics(periodTag) {
+    const added = [];
+    const ord = pickRawForMetric('order', periodTag);
+    if (ord) added.push(...sourcesFromRaw(ord, periodTag || ord.range || '', ['成交额(元)', '成单']));
+    const ch = pickRawForMetric('change', periodTag);
+    if (ch) added.push(...sourcesFromRaw(ch, periodTag || ch.range || '', ['变动金额(元)']));
+    // 去掉旧的同标签来源，再写入，避免多张表相加、以及被错误页污染的成单
+    if (added.length || periodTag) {
+      const labs = new Set(added.map(s => s.label));
+      // 有统计期间但没有匹配到变动表 → 清掉旧的「本月变动」避免全是 0 还以为读到了
+      let rest = getSources().filter(s => !labs.has(s.label));
+      if (periodTag && !labs.has('变动金额(元)')) rest = rest.filter(s => s.label !== '变动金额(元)');
+      if (periodTag && !labs.has('成交额(元)')) rest = rest.filter(s => s.label !== '成交额(元)' && s.label !== '成单');
+      setSources(rest);
+      if (added.length) upsertSources(added);
+    }
+    return added;
   }
   /** 用某张已抓明细直接刷新顾问排行，并切到默认排行视图 */
   function applyRawToRanking(pk) {
     const t = getRaw()[pk];
     if (!t) return '找不到这份数据';
-    const src = sourcesFromRaw(t);
-    if (!src.length) return '这张表没有成交金额/可计数列，出不了顾问排行';
-    const msgs = upsertSources(src);
     const st = getSettings();
     st.tpl = '';
-    st.rankPeriod = t.range || '';
+    // 只有成交表才改统计期间；变动表沿用/带上自己的 range
+    if (isOrderRaw(t)) st.rankPeriod = t.range || '';
+    else if (isChangeRaw(t) && t.range && !st.rankPeriod) st.rankPeriod = t.range;
     setSettings(st);
+    const period = st.rankPeriod || t.range || '';
+    const src = syncRankingMetrics(period);
+    // 若点的是变动表，确保至少用这张
+    if (isChangeRaw(t) || (t.headers || []).includes('变动金额')) {
+      const bd = sourcesFromRaw(t, period, ['变动金额(元)']);
+      if (bd.length) {
+        setSources(getSources().filter(s => s.label !== '变动金额(元)'));
+        upsertSources(bd);
+      }
+    }
+    if (!getSources().some(s => s.label === '成交额(元)' || s.label === '变动金额(元)')) {
+      const one = sourcesFromRaw(t, period);
+      if (!one.length) return '这张表没有成交金额/变动金额，出不了顾问排行';
+      upsertSources(one);
+    }
     renderTplSel(); renderSources(); renderRanking();
-    return `已用「${t.name || pk}」更新顾问排行` + (t.range ? `（${rangeText(parseRange(t.range) || { from: t.range, to: t.range })}）` : '') + (msgs.length ? '；' + msgs.join('；') : '');
+    const tip = period && parseRange(period) ? `（${rangeText(parseRange(period))}）` : '';
+    return `已更新顾问排行${tip}` + (src.length ? '' : '');
   }
 
   function storeRaw(pk, name, res, nameIdx, range) {
@@ -1758,16 +1836,15 @@
     if (st.tpl === '__fbsum') return fbSummaryView();
     let tpl = st.tpl && getTpls().find(t => t.id === st.tpl);
     if (tpl) { tpl = fixBindings(regenPreset(tpl)); return templateView(tpl); }
-    // 顾问排行缺成交额时，自动用最近一张成交明细补上（解决历史抓取没写入排行来源）
-    if (!getSources().some(s => s.label === '成交额(元)')) {
-      const orders = Object.values(getRaw()).filter(t => nameRole(t.name) === 'order' || (t.headers || []).includes('成交金额')).sort((a, b) => (b.time || 0) - (a.time || 0));
-      if (orders.length) {
-        const src = sourcesFromRaw(orders[0]);
-        if (src.length) {
-          upsertSources(src);
-          if (!st.rankPeriod && orders[0].range) { st.rankPeriod = orders[0].range; setSettings(st); }
-        }
+    // 缺成交额或变动金额时，按统计期间从明细自动补齐
+    const needOrder = !getSources().some(s => s.label === '成交额(元)');
+    const needChange = !getSources().some(s => s.label === '变动金额(元)');
+    if (needOrder || needChange) {
+      if (needOrder && !st.rankPeriod) {
+        const ord = pickRawForMetric('order', '');
+        if (ord && ord.range) { st.rankPeriod = ord.range; setSettings(st); }
       }
+      syncRankingMetrics(st.rankPeriod || '');
     }
     return rankingView(computeRanking(getSources(), getRoster(), st));
   }
@@ -2416,28 +2493,33 @@
       const step = addStep ? saveStepFrom(nameIdx, picked) : null;
       const key = histOnly ? `${pageKey()}·${rg.tag}` : pageKey();
       const nraw = storeRaw(key, step ? step.name : key, res, nameIdx, rg.tag);
-      // 历史抓取也写入顾问排行来源：否则「不勾加入步骤」时排行一直是 0
+      const rawT = getRaw()[key];
       const built = buildSources(res, nameIdx, picked, pageKey(), location.href, step ? step.id : null);
-      let msgs = upsertSources(built.sources);
-      // 没勾选成交列时，用刚存的明细兜底生成成交额/成单
-      if (!built.sources.some(s => s.label === '成交额(元)' || s.label === '成单')) {
-        const rawT = getRaw()[key];
-        const fb = sourcesFromRaw(rawT);
-        if (fb.length) msgs = msgs.concat(upsertSources(fb));
+      const producedOrder = isOrderRaw(rawT) || built.sources.some(s => s.label === '成交额(元)');
+      const producedChange = isChangeRaw(rawT) || built.sources.some(s => s.label === '变动金额(元)');
+      let msgs = [];
+      // 非成交/变动表：只存明细，不改顾问排行（避免 OCQ·03~10 这类表污染成单/期间）
+      if (producedOrder || producedChange) {
+        const keepLabs = producedOrder ? ['成交额(元)', '成单', '变动金额(元)'] : ['变动金额(元)'];
+        msgs = upsertSources(built.sources.filter(s => keepLabs.includes(s.label)));
+        const st = getSettings();
+        st.tpl = '';
+        if (producedOrder) st.rankPeriod = rg.tag || '';
+        else if (producedChange && rg.tag && !st.rankPeriod) st.rankPeriod = rg.tag;
+        setSettings(st);
+        const synced = syncRankingMetrics(st.rankPeriod || rg.tag || '');
+        if (synced.length) msgs = msgs.concat([...new Set(synced.map(s => s.label))].map(l => `「${l}」已按期间对齐`));
+      } else if (!histOnly && built.sources.length) {
+        // 本月日常步骤里的客资/看位等仍写入排行；历史杂表不改排行
+        msgs = upsertSources(built.sources.filter(s => !['成交额(元)', '成单', '变动金额(元)'].includes(s.label) || /客资|看位|无效|有效/.test(s.label)));
       }
       const head = `【${pageKey()}】${res.pages} 页，${res.collected}${res.total != null ? '/' + res.total : ''} 条（明细 ${nraw} 行已存）` + (res.incomplete ? `  ⚠ 只抓到 ${res.collected}/${res.total} 条，可能没翻完页` : '');
       addLog([head].concat(built.lines).join('\n') + (msgs.length ? '\n   ' + msgs.join('；') : ''));
       const fcBad = built.sources.some(s => s.footer && !s.footer.ok);
-      const hasOrder = getSources().some(s => s.label === '成交额(元)' || s.label === '成单');
-      if (hasOrder) {
-        const st = getSettings();
-        st.tpl = '';
-        st.rankPeriod = rg.tag || '';
-        setSettings(st);
-      }
-      const periodTip = rg.tag ? `，已更新顾问排行（${rangeText(parseRange(rg.tag) || { from: rg.tag, to: rg.tag })}）` : (hasOrder ? '，已更新顾问排行' : '');
+      const st2 = getSettings();
+      const periodTip = (producedOrder || producedChange) ? (st2.rankPeriod && parseRange(st2.rankPeriod) ? `，已更新顾问排行（${rangeText(parseRange(st2.rankPeriod))}）` : '，已更新顾问排行') : '';
       $('prog').textContent = (res.incomplete ? `⚠ 只抓到 ${res.collected}/${res.total} 条` : (histOnly ? `✅ 抓好了：${nraw} 条，存为「${key}」` : step ? `✅ 抓好了：${nraw} 条，已记进取数步骤` : `✅ 抓好了：${nraw} 条`)) + periodTip + (fcBad ? '\n⚠ 和页面合计对不上，详见「更多 › 清空 / 记录」' : '');
-      W.__ocqLastResult = { res: { pages: res.pages, collected: res.collected, total: res.total, incomplete: res.incomplete }, lines: built.lines, msgs, nraw, key, histOnly };
+      W.__ocqLastResult = { res: { pages: res.pages, collected: res.collected, total: res.total, incomplete: res.incomplete }, lines: built.lines, msgs, nraw, key, histOnly, producedOrder, producedChange };
       renderAll(); doScan();
     } catch (e) {
       $('prog').textContent = '出错：' + e.message;
@@ -2552,6 +2634,6 @@
     fbSummaryView, exportView, buildWorkbook,
     openPanel, doScan, startGrab, startReplay, runReplay, getSources, getSteps, setSteps, computeRanking, getRoster, getSettings,
     parsePaste, num, analyze, exportExcel, drawCanvas, summaryRows, infoLine, timeProgress, redCut, setSettingsForTest: setSettings, findBestTable, rewriteMonthDates, root, isBusy: () => busy, isReplaying: () => replaying, FIXED_COLS,
-    getRaw, sourcesFromRaw, applyRawToRanking, getTpls, saveTemplate, availablePresets, applyPreset, collapseProg, bestPersonIdx, fbPresets, applyFb, pageRange, parseDate, lastFullMonths, getUI: () => gmGet('ocq_ui', {}), buildPreset, openNewBox, openWizard, importTemplates, computeTemplate, compileFormula, rawTables, currentView, templateView, rankingView, groupRanking, openEditor, setRosterForTest: setRoster, renderAll
+    getRaw, sourcesFromRaw, applyRawToRanking, syncRankingMetrics, pickRawForMetric, getTpls, saveTemplate, availablePresets, applyPreset, collapseProg, bestPersonIdx, fbPresets, applyFb, pageRange, parseDate, lastFullMonths, getUI: () => gmGet('ocq_ui', {}), buildPreset, openNewBox, openWizard, importTemplates, computeTemplate, compileFormula, rawTables, currentView, templateView, rankingView, groupRanking, openEditor, setRosterForTest: setRoster, renderAll
   };
 })();
