@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.6.4
+// @version      0.6.5
 // @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -24,7 +24,7 @@
 
   const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const SCRIPT_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.6.4';
+  const SCRIPT_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.6.5';
 
   // ---------------- 存储 ----------------
   const gmGet = (k, d) => {
@@ -617,6 +617,20 @@
     return t.rows.filter(r => { const d = parseDate(r[di]); return d && d >= a && d <= b; });
   }
   const COUNT_RANK_LABELS = ['总客资数量', '无效客资', '有效客资', '看位数'];
+  /** 从明细表名判断应写入顾问排行的计数列（无效/线索/看位） */
+  function rankingCountLabelFromRaw(t) {
+    const n = String((t && (t.name || t.pageKey)) || '').split('·')[0];
+    if (/无效/.test(n)) return '无效客资';
+    if (/看位|邀约/.test(n)) return '看位数';
+    if (/有效客资/.test(n) && !/线索/.test(n)) return '有效客资';
+    if (/客资|线索/.test(n)) return '总客资数量';
+    const role = nameRole(n);
+    if (role === 'invalid') return '无效客资';
+    if (role === 'visit') return '看位数';
+    if (role === 'lead' || role === 'valid') return '总客资数量';
+    return pageCountField(n);
+  }
+  const sourceDataSum = label => getSources().filter(s => s.label === label).reduce((a, s) => a + sumOf(s.data), 0);
   /** 从已存明细表生成顾问排行用的来源；periodTag 时按日期过滤 */
   function sourcesFromRaw(t, periodTag, onlyLabels) {
     if (!t || !t.headers || !t.rows) return [];
@@ -656,7 +670,7 @@
       if (kind === 'order') return isOrderRaw(t);
       if (kind === 'change') return isChangeRaw(t) || (t.headers || []).includes('变动金额');
       if (kind === 'visit') return role === 'visit' || /看位|邀约/.test(n);
-      if (kind === 'invalid') return role === 'invalid' || /无效/.test(n);
+      if (kind === 'invalid') return role === 'invalid' || /无效/.test(n) || /无效/.test(String(t.pageKey || '').split('·')[0]);
       if (kind === 'lead') {
         if (role === 'invalid' || role === 'order' || role === 'change' || role === 'visit') return false;
         if (isOrderRaw(t) || isChangeRaw(t)) return false;
@@ -1882,11 +1896,20 @@
     if (st.tpl === '__fbsum') return fbSummaryView();
     let tpl = st.tpl && getTpls().find(t => t.id === st.tpl);
     if (tpl) { tpl = fixBindings(regenPreset(tpl)); return templateView(tpl); }
-    // 缺成交额/变动/总客资时，按统计期间从明细自动补齐（含已抓的判定有效线索→总客资）
+    // 缺成交/变动/总客资/无效/看位，或计数列为 0 但明细有数 → 从明细按期间补齐
+    const period0 = st.rankPeriod || '';
+    const needFill = (label, kind) => {
+      if (!getSources().some(s => s.label === label)) return true;
+      if (sourceDataSum(label) > 0) return false;
+      const t = pickRawForMetric(kind, period0);
+      return !!(t && (t.rows || []).length);
+    };
     const needOrder = !getSources().some(s => s.label === '成交额(元)');
     const needChange = !getSources().some(s => s.label === '变动金额(元)');
-    const needLead = !getSources().some(s => s.label === '总客资数量');
-    if (needOrder || needChange || needLead) {
+    const needLead = needFill('总客资数量', 'lead');
+    const needInvalid = needFill('无效客资', 'invalid');
+    const needVisit = needFill('看位数', 'visit');
+    if (needOrder || needChange || needLead || needInvalid || needVisit) {
       if (needOrder && !st.rankPeriod) {
         const ord = pickRawForMetric('order', '');
         if (ord && ord.range) { st.rankPeriod = ord.range; setSettings(st); }
@@ -2539,7 +2562,7 @@
       const histOnly = !addStep && rg.hist;
       const step = addStep ? saveStepFrom(nameIdx, picked) : null;
       const key = histOnly ? `${pageKey()}·${rg.tag}` : pageKey();
-      const nraw = storeRaw(key, step ? step.name : key, res, nameIdx, rg.tag);
+      const nraw = storeRaw(key, step ? step.name : pageKey(), res, nameIdx, rg.tag);
       const rawT = getRaw()[key];
       const built = buildSources(res, nameIdx, picked, pageKey(), location.href, step ? step.id : null);
       const producedOrder = isOrderRaw(rawT) || built.sources.some(s => s.label === '成交额(元)');
@@ -2548,7 +2571,8 @@
       for (const s of built.sources) {
         if (s.label === '有效客资' && /判定有效|有效线索/.test(pageKey() + (rawT && rawT.name || ''))) s.label = '总客资数量';
       }
-      const producedCount = built.sources.some(s => COUNT_RANK_LABELS.includes(s.label));
+      const countLab = rankingCountLabelFromRaw(rawT) || rankingCountLabelFromRaw({ name: pageKey() });
+      const producedCount = !!countLab || built.sources.some(s => COUNT_RANK_LABELS.includes(s.label));
       let msgs = [];
       // 非成交/变动/客资表：只存明细，不改顾问排行（避免 OCQ·03~10 这类表污染成单/期间）
       if (producedOrder || producedChange) {
@@ -2561,25 +2585,34 @@
         setSettings(st);
         const synced = syncRankingMetrics(st.rankPeriod || rg.tag || '');
         if (synced.length) msgs = msgs.concat([...new Set(synced.map(s => s.label))].map(l => `「${l}」已按期间对齐`));
-      } else if (producedCount && built.sources.length) {
-        // 客资/看位/无效：本月或历史区间都写入排行
-        let countSrc = built.sources.filter(s => COUNT_RANK_LABELS.includes(s.label)).map(s => {
-          const pk = histOnly ? key : s.pageKey;
-          return Object.assign({}, s, {
-            pageKey: pk,
-            id: sourceId(pk, s.colKey, s.mode),
-            range: rg.tag || '',
-            pageName: (rawT && rawT.name) || key
-          });
-        });
-        const replaceLabs = new Set(countSrc.map(s => s.label));
-        setSources(getSources().filter(s => !replaceLabs.has(s.label)));
-        msgs = upsertSources(countSrc);
+      } else if (producedCount) {
+        // 客资/看位/无效：不依赖勾选列，直接从明细按表名写入排行（历史区间同样写入）
         const st = getSettings();
+        const period = st.rankPeriod || rg.tag || '';
+        let countSrc = countLab ? sourcesFromRaw(rawT, period || rg.tag || '', [countLab]) : [];
+        if (!countSrc.length) {
+          countSrc = built.sources.filter(s => COUNT_RANK_LABELS.includes(s.label)).map(s => {
+            const pk = histOnly ? key : s.pageKey;
+            return Object.assign({}, s, {
+              pageKey: pk,
+              id: sourceId(pk, s.colKey, s.mode),
+              range: rg.tag || '',
+              pageName: (rawT && rawT.name) || key
+            });
+          });
+        }
+        if (countSrc.length) {
+          const replaceLabs = new Set(countSrc.map(s => s.label));
+          setSources(getSources().filter(s => !replaceLabs.has(s.label)));
+          msgs = upsertSources(countSrc);
+        }
         st.tpl = '';
         setSettings(st);
         const synced = syncRankingMetrics(st.rankPeriod || rg.tag || '');
         if (synced.length) msgs = msgs.concat([...new Set(synced.map(s => s.label))].map(l => `「${l}」已按期间对齐`));
+        if (!countSrc.length && !synced.some(s => COUNT_RANK_LABELS.includes(s.label))) {
+          msgs.push('这张表已存明细，但没写出顾问计数列（请确认有顾问姓名列）');
+        }
       } else if (!histOnly && built.sources.length) {
         msgs = upsertSources(built.sources.filter(s => !['成交额(元)', '成单', '变动金额(元)'].includes(s.label) || /客资|看位|无效|有效/.test(s.label)));
       }
