@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.6.6
+// @version      0.6.7
 // @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -24,7 +24,7 @@
 
   const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const SCRIPT_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.6.6';
+  const SCRIPT_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.6.7';
 
   // ---------------- 存储 ----------------
   const gmGet = (k, d) => {
@@ -698,9 +698,8 @@
       let sc = (t.time || 0) / 1e13;
       if (kind === 'change' && /变动/.test(n)) sc += 5;
       if (kind === 'lead') {
-        // 优先装修线索/总客资；没有则用判定有效线索
-        if (/装修线索|总客资/.test(n) || (role === 'lead' && !/有效/.test(n))) sc += 15;
-        else if (role === 'valid' || /判定有效|有效线索/.test(n)) sc += 5;
+        // 最近抓取优先（用户刚打开哪张线索表就以哪张为准），不再用装修线索强行盖掉判定有效
+        sc += (t.time || 0) / 1e12;
       }
       if (R && own && !(own.to < R.from || own.from > R.to)) sc += 20;
       if (R && !own && filterRawByPeriod(t, periodTag, kind === 'change').length) sc += 10;
@@ -711,35 +710,55 @@
     scored.sort((a, b) => b.sc - a.sc || b.n - a.n);
     return scored.length ? scored[0].t : null;
   }
-  /** 按统计期间从明细补成交/变动/总客资/看位/无效（缺哪补哪） */
-  function syncRankingMetrics(periodTag) {
+  /** 用某一张已抓明细独占写入计数列（不按期间再筛、不合并其它表） */
+  function bindExclusiveCountFromRaw(t, label, forcePk) {
+    if (!t || !label) return [];
+    // 空 periodTag → 用整表行，合计=本表行数
+    const src = sourcesFromRaw(t, '', [label]);
+    if (!src.length) return [];
+    const pk = forcePk || t.pageKey || t.name;
+    return src.map(s => Object.assign({}, s, {
+      pageKey: pk,
+      id: sourceId(pk, s.colKey, s.mode),
+      range: t.range || '',
+      pageName: t.name || pk,
+      total: (t.rows || []).length,
+      rows: sumOf(s.data)
+    }));
+  }
+  const COUNT_PIN_KEY = { '总客资数量': 'rankLeadKey', '无效客资': 'rankInvalidKey', '看位数': 'rankVisitKey' };
+  /** 按统计期间从明细补成交/变动/客资等；opts.skipLabels 跳过；钉住的线索表优先 */
+  function syncRankingMetrics(periodTag, opts) {
+    opts = opts || {};
+    const skip = new Set(opts.skipLabels || []);
+    const st = getSettings();
     const added = [];
     const ord = pickRawForMetric('order', periodTag);
-    if (ord) added.push(...sourcesFromRaw(ord, periodTag || ord.range || '', ['成交额(元)', '成单']));
+    if (ord && !skip.has('成交额(元)')) added.push(...sourcesFromRaw(ord, periodTag || ord.range || '', ['成交额(元)', '成单']));
     const ch = pickRawForMetric('change', periodTag);
-    if (ch) added.push(...sourcesFromRaw(ch, periodTag || ch.range || '', ['变动金额(元)']));
-    const lead = pickRawForMetric('lead', periodTag);
-    if (lead) added.push(...sourcesFromRaw(lead, periodTag || lead.range || '', ['总客资数量']));
-    const visit = pickRawForMetric('visit', periodTag);
-    if (visit) added.push(...sourcesFromRaw(visit, periodTag || visit.range || '', ['看位数']));
-    const inv = pickRawForMetric('invalid', periodTag);
-    if (inv) added.push(...sourcesFromRaw(inv, periodTag || inv.range || '', ['无效客资']));
-    // 去掉旧的同标签来源，再写入，避免多张表相加、以及被错误页污染的成单
+    if (ch && !skip.has('变动金额(元)')) added.push(...sourcesFromRaw(ch, periodTag || ch.range || '', ['变动金额(元)']));
+    if (!skip.has('总客资数量')) {
+      const pinned = st.rankLeadKey && getRaw()[st.rankLeadKey];
+      const lead = pinned || pickRawForMetric('lead', periodTag);
+      if (lead) added.push(...bindExclusiveCountFromRaw(lead, '总客资数量', pinned ? st.rankLeadKey : (lead.pageKey || lead.name)));
+    }
+    if (!skip.has('看位数')) {
+      const pinned = st.rankVisitKey && getRaw()[st.rankVisitKey];
+      const visit = pinned || pickRawForMetric('visit', periodTag);
+      if (visit) added.push(...bindExclusiveCountFromRaw(visit, '看位数', pinned ? st.rankVisitKey : (visit.pageKey || visit.name)));
+    }
+    if (!skip.has('无效客资')) {
+      const pinned = st.rankInvalidKey && getRaw()[st.rankInvalidKey];
+      const inv = pinned || pickRawForMetric('invalid', periodTag);
+      if (inv) added.push(...bindExclusiveCountFromRaw(inv, '无效客资', pinned ? st.rankInvalidKey : (inv.pageKey || inv.name)));
+    }
     if (added.length || periodTag) {
       const labs = new Set(added.map(s => s.label));
-      // 有统计期间但没有匹配到变动表 → 清掉旧的「本月变动」避免全是 0 还以为读到了
       let rest = getSources().filter(s => !labs.has(s.label));
       if (periodTag && !labs.has('变动金额(元)')) rest = rest.filter(s => s.label !== '变动金额(元)');
       if (periodTag && !labs.has('成交额(元)')) rest = rest.filter(s => s.label !== '成交额(元)' && s.label !== '成单');
-      // 标准列去重：同标签只留将写入的一份
       setSources(rest);
       if (added.length) upsertSources(added);
-    }
-    // 即使没有新 lead，也清掉重复的「总客资数量」只留条数最多的一份
-    const leads = getSources().filter(s => s.label === '总客资数量');
-    if (leads.length > 1) {
-      leads.sort((a, b) => (b.rows || sumOf(b.data)) - (a.rows || sumOf(a.data)) || (b.time || 0) - (a.time || 0));
-      setSources(getSources().filter(s => s.label !== '总客资数量' || s === leads[0]));
     }
     return added;
   }
@@ -765,19 +784,19 @@
     }
     const role = nameRole(t.name) || tableRole(t);
     if (role === 'lead' || role === 'valid' || /线索|客资/.test(String(t.name || '').split('·')[0])) {
-      const ld = sourcesFromRaw(t, period, ['总客资数量']);
-      if (ld.length) {
-        setSources(getSources().filter(s => s.label !== '总客资数量'));
-        upsertSources(ld);
-      }
+      st.rankLeadKey = pk; setSettings(st);
+      const ld = bindExclusiveCountFromRaw(t, '总客资数量', pk);
+      if (ld.length) upsertSources(ld);
     }
     if (role === 'visit') {
-      const vs = sourcesFromRaw(t, period, ['看位数']);
-      if (vs.length) { setSources(getSources().filter(s => s.label !== '看位数')); upsertSources(vs); }
+      st.rankVisitKey = pk; setSettings(st);
+      const vs = bindExclusiveCountFromRaw(t, '看位数', pk);
+      if (vs.length) upsertSources(vs);
     }
     if (role === 'invalid') {
-      const iv = sourcesFromRaw(t, period, ['无效客资']);
-      if (iv.length) { setSources(getSources().filter(s => s.label !== '无效客资')); upsertSources(iv); }
+      st.rankInvalidKey = pk; setSettings(st);
+      const iv = bindExclusiveCountFromRaw(t, '无效客资', pk);
+      if (iv.length) upsertSources(iv);
     }
     if (!getSources().some(s => s.label === '成交额(元)' || s.label === '变动金额(元)' || s.label === '总客资数量')) {
       const one = sourcesFromRaw(t, period);
@@ -1931,6 +1950,11 @@
     // 缺成交/变动/总客资/无效/看位，或计数列为 0 但明细有数 → 从明细按期间补齐
     const period0 = st.rankPeriod || '';
     const needFill = (label, kind) => {
+      const pin = st[COUNT_PIN_KEY[label]];
+      if (pin && getRaw()[pin] && getSources().some(s => s.label === label && (s.pageKey === pin || String(s.pageKey).startsWith(String(pin).split('·')[0])))) {
+        // 已钉住用户刚抓的表 → 不再自动换绑
+        if (sourceDataSum(label) > 0) return false;
+      }
       if (!getSources().some(s => s.label === label)) return true;
       if (sourceDataSum(label) > 0) return false;
       const t = pickRawForMetric(kind, period0);
@@ -1947,7 +1971,12 @@
         const ord = pickRawForMetric('order', '');
         if (ord && ord.range) { st.rankPeriod = ord.range; setSettings(st); }
       }
-      syncRankingMetrics(st.rankPeriod || '');
+      // 有钉住的线索时，缺数才补；补的时候也会尊从 rankLeadKey
+      const skip = [];
+      if (st.rankLeadKey && getRaw()[st.rankLeadKey] && sourceDataSum('总客资数量') > 0) skip.push('总客资数量');
+      if (st.rankInvalidKey && getRaw()[st.rankInvalidKey] && sourceDataSum('无效客资') > 0) skip.push('无效客资');
+      if (st.rankVisitKey && getRaw()[st.rankVisitKey] && sourceDataSum('看位数') > 0) skip.push('看位数');
+      syncRankingMetrics(st.rankPeriod || '', { skipLabels: skip });
     }
     return rankingView(computeRanking(getSources(), getRoster(), st));
   }
@@ -2619,33 +2648,31 @@
         const synced = syncRankingMetrics(st.rankPeriod || rg.tag || '');
         if (synced.length) msgs = msgs.concat([...new Set(synced.map(s => s.label))].map(l => `「${l}」已按期间对齐`));
       } else if (producedCount) {
-        // 客资/看位/无效：不依赖勾选列，直接从明细按表名写入排行（历史区间同样写入）
+        // 客资/看位/无效：以「当前这张表」独占对应列，合计=本表行数；禁止再被其它历史线索表盖掉
         const st = getSettings();
-        const period = st.rankPeriod || rg.tag || '';
-        let countSrc = countLab ? sourcesFromRaw(rawT, period || rg.tag || '', [countLab]) : [];
-        if (!countSrc.length) {
-          countSrc = built.sources.filter(s => COUNT_RANK_LABELS.includes(s.label)).map(s => {
-            const pk = histOnly ? key : s.pageKey;
-            return Object.assign({}, s, {
-              pageKey: pk,
-              id: sourceId(pk, s.colKey, s.mode),
-              range: rg.tag || '',
-              pageName: (rawT && rawT.name) || key
-            });
-          });
+        st.tpl = '';
+        const pinKey = COUNT_PIN_KEY[countLab];
+        if (pinKey) st[pinKey] = key;
+        setSettings(st);
+        let countSrc = countLab ? bindExclusiveCountFromRaw(rawT, countLab, key) : [];
+        if (!countSrc.length && nameIdx >= 0) {
+          const { data, used } = aggregateCol(rawT.rows, (rawT.headers || []).indexOf(rawT.nameHeader) >= 0 ? rawT.headers.indexOf(rawT.nameHeader) : nameIdx, (rawT.headers || []).indexOf(rawT.nameHeader) >= 0 ? rawT.headers.indexOf(rawT.nameHeader) : nameIdx, 'count');
+          const nh = rawT.nameHeader || (rawT.headers && rawT.headers[nameIdx]) || '沟通负责人';
+          countSrc = [{
+            id: sourceId(key, nh + '#nm', 'count'), pageKey: key, label: countLab || '总客资数量',
+            colHeader: nh, colKey: nh + '#nm', mode: 'count', data, rows: used, total: (rawT.rows || []).length,
+            time: Date.now(), range: rg.tag || '', pageName: rawT.name || key
+          }];
         }
         if (countSrc.length) {
-          const replaceLabs = new Set(countSrc.map(s => s.label));
-          setSources(getSources().filter(s => !replaceLabs.has(s.label)));
           msgs = upsertSources(countSrc);
+          const n = sumOf(countSrc[0].data);
+          msgs.push(`「${countSrc[0].label}」仅本页 ${n} 条（按${countSrc[0].colHeader}，空→未分配）`);
         }
-        st.tpl = '';
-        setSettings(st);
-        const synced = syncRankingMetrics(st.rankPeriod || rg.tag || '');
+        // 只补成交/变动等，绝不重绑刚写好的计数列
+        const synced = syncRankingMetrics(st.rankPeriod || rg.tag || '', { skipLabels: countLab ? [countLab] : COUNT_RANK_LABELS });
         if (synced.length) msgs = msgs.concat([...new Set(synced.map(s => s.label))].map(l => `「${l}」已按期间对齐`));
-        if (!countSrc.length && !synced.some(s => COUNT_RANK_LABELS.includes(s.label))) {
-          msgs.push('这张表已存明细，但没写出顾问计数列（请确认有顾问姓名列）');
-        }
+        if (!countSrc.length) msgs.push('这张表已存明细，但没写出顾问计数列（请确认有沟通负责人列）');
       } else if (!histOnly && built.sources.length) {
         msgs = upsertSources(built.sources.filter(s => !['成交额(元)', '成单', '变动金额(元)'].includes(s.label) || /客资|看位|无效|有效/.test(s.label)));
       }
@@ -2653,7 +2680,11 @@
       addLog([head].concat(built.lines).join('\n') + (msgs.length ? '\n   ' + msgs.join('；') : ''));
       const fcBad = built.sources.some(s => s.footer && !s.footer.ok);
       const st2 = getSettings();
-      const periodTip = (producedOrder || producedChange || producedCount) ? (st2.rankPeriod && parseRange(st2.rankPeriod) ? `，已更新顾问排行（${rangeText(parseRange(st2.rankPeriod))}）` : '，已更新顾问排行') : '';
+      let periodTip = (producedOrder || producedChange || producedCount) ? (st2.rankPeriod && parseRange(st2.rankPeriod) ? `，已更新顾问排行（${rangeText(parseRange(st2.rankPeriod))}）` : '，已更新顾问排行') : '';
+      if (producedCount && countLab) {
+        const cs = getSources().find(s => s.label === countLab);
+        if (cs) periodTip += `，${countLab}合计 ${sumOf(cs.data)}（仅本页）`;
+      }
       $('prog').textContent = (res.incomplete ? `⚠ 只抓到 ${res.collected}/${res.total} 条` : (histOnly ? `✅ 抓好了：${nraw} 条，存为「${key}」` : step ? `✅ 抓好了：${nraw} 条，已记进取数步骤` : `✅ 抓好了：${nraw} 条`)) + periodTip + (fcBad ? '\n⚠ 和页面合计对不上，详见「更多 › 清空 / 记录」' : '');
       W.__ocqLastResult = { res: { pages: res.pages, collected: res.collected, total: res.total, incomplete: res.incomplete }, lines: built.lines, msgs, nraw, key, histOnly, producedOrder, producedChange };
       renderAll(); doScan();
