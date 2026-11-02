@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.6.5
+// @version      0.6.6
 // @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -24,7 +24,7 @@
 
   const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const SCRIPT_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.6.5';
+  const SCRIPT_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.6.6';
 
   // ---------------- 存储 ----------------
   const gmGet = (k, d) => {
@@ -447,8 +447,16 @@
     const out = {};
     let used = 0;
     for (const r of rows) {
-      const name = (r[nameIdx] || '').trim();
-      if (!name || /合计|总计|小计|汇总/.test(name) || !looksLikePersonName(name)) continue;
+      let name = (r[nameIdx] || '').trim();
+      if (/合计|总计|小计|汇总/.test(name)) continue;
+      // 计数（按行数）：空负责人进「未分配」，保证合计=表行数；非人名垃圾行仍跳过
+      if (!name) {
+        if (mode === 'count' && colIdx === nameIdx) name = '未分配';
+        else continue;
+      } else if (!looksLikePersonName(name)) {
+        if (mode === 'count' && colIdx === nameIdx) name = '未分配';
+        else continue;
+      }
       const raw = (r[colIdx] || '').trim();
       if (mode === 'count') {
         if (colIdx !== nameIdx && !raw) continue;
@@ -506,10 +514,14 @@
   const sourceId = (pk, colKey, mode) => `${pk}|${colKey}|${mode}`;
   const sumOf = d => Object.values(d || {}).reduce((a, b) => a + b, 0);
 
-  /** 把一次抓取结果写成来源（同 id 替换，不累加） */
+  /** 顾问排行标准列：同名标签只保留一份，禁止装修线索+判定有效线索相加 */
+  const EXCLUSIVE_SOURCE_LABELS = new Set(['成交额(元)', '成单', '看位数', '总客资数量', '无效客资', '有效客资', '变动金额(元)']);
+  /** 把一次抓取结果写成来源（同 id 替换；标准列同标签先清掉旧的） */
   function upsertSources(newOnes) {
-    const all = getSources();
+    let all = getSources();
     const msgs = [];
+    const dropLabs = new Set(newOnes.filter(s => EXCLUSIVE_SOURCE_LABELS.has(s.label)).map(s => s.label));
+    if (dropLabs.size) all = all.filter(s => !dropLabs.has(s.label));
     for (const s of newOnes) {
       const i = all.findIndex(x => x.id === s.id);
       if (i >= 0) {
@@ -719,8 +731,15 @@
       let rest = getSources().filter(s => !labs.has(s.label));
       if (periodTag && !labs.has('变动金额(元)')) rest = rest.filter(s => s.label !== '变动金额(元)');
       if (periodTag && !labs.has('成交额(元)')) rest = rest.filter(s => s.label !== '成交额(元)' && s.label !== '成单');
+      // 标准列去重：同标签只留将写入的一份
       setSources(rest);
       if (added.length) upsertSources(added);
+    }
+    // 即使没有新 lead，也清掉重复的「总客资数量」只留条数最多的一份
+    const leads = getSources().filter(s => s.label === '总客资数量');
+    if (leads.length > 1) {
+      leads.sort((a, b) => (b.rows || sumOf(b.data)) - (a.rows || sumOf(a.data)) || (b.time || 0) - (a.time || 0));
+      setSources(getSources().filter(s => s.label !== '总客资数量' || s === leads[0]));
     }
     return added;
   }
@@ -1194,10 +1213,23 @@
   // ---------------- 排行 ----------------
   function computeRanking(sources, roster, settings) {
     const agg = {}, extras = [];
+    // 标准列若误存了多份来源，只取「条数最多 / 最新」的一份，避免 装修线索+判定有效线索 加出 622
+    const byLabel = {};
     for (const s of sources) {
-      const b = agg[s.label] = agg[s.label] || {};
-      for (const [n, v] of Object.entries(s.data || {})) b[norm(n)] = { name: n, v: ((b[norm(n)] && b[norm(n)].v) || 0) + v };
-      if (!STD.includes(s.label) && !extras.includes(s.label)) extras.push(s.label);
+      if (EXCLUSIVE_SOURCE_LABELS.has(s.label)) {
+        const cur = byLabel[s.label];
+        const score = (s.rows || sumOf(s.data) || 0) * 1e7 + (s.time || 0);
+        const curScore = cur ? (cur.rows || sumOf(cur.data) || 0) * 1e7 + (cur.time || 0) : -1;
+        if (!cur || score >= curScore) byLabel[s.label] = s;
+      } else {
+        const b = agg[s.label] = agg[s.label] || {};
+        for (const [n, v] of Object.entries(s.data || {})) b[norm(n)] = { name: n, v: ((b[norm(n)] && b[norm(n)].v) || 0) + v };
+        if (!extras.includes(s.label)) extras.push(s.label);
+      }
+    }
+    for (const s of Object.values(byLabel)) {
+      const b = agg[s.label] = {};
+      for (const [n, v] of Object.entries(s.data || {})) b[norm(n)] = { name: n, v };
     }
     const names = new Map();
     for (const r of roster) if (r.name) names.set(norm(r.name), r.name);
@@ -1906,10 +1938,11 @@
     };
     const needOrder = !getSources().some(s => s.label === '成交额(元)');
     const needChange = !getSources().some(s => s.label === '变动金额(元)');
-    const needLead = needFill('总客资数量', 'lead');
-    const needInvalid = needFill('无效客资', 'invalid');
-    const needVisit = needFill('看位数', 'visit');
-    if (needOrder || needChange || needLead || needInvalid || needVisit) {
+    const dupLead = getSources().filter(s => s.label === '总客资数量').length > 1;
+    const needLead = dupLead || needFill('总客资数量', 'lead');
+    const needInvalid = needFill('无效客资', 'invalid') || getSources().filter(s => s.label === '无效客资').length > 1;
+    const needVisit = needFill('看位数', 'visit') || getSources().filter(s => s.label === '看位数').length > 1;
+    if (needOrder || needChange || needLead || needInvalid || needVisit || dupLead) {
       if (needOrder && !st.rankPeriod) {
         const ord = pickRawForMetric('order', '');
         if (ord && ord.range) { st.rankPeriod = ord.range; setSettings(st); }
