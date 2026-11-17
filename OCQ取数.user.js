@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.6.8
+// @version      0.6.9
 // @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -24,7 +24,7 @@
 
   const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const SCRIPT_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.6.8';
+  const SCRIPT_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.6.9';
 
   // ---------------- 存储 ----------------
   const gmGet = (k, d) => {
@@ -793,6 +793,19 @@
     if (added.length) upsertSources(added);
     return added;
   }
+  /** 成交额与成单必须来自同一张钉住的成交表；缺一、绑错表、或有金额却 0 成都要整表重绑 */
+  function orderSourcesNeedRebind(pin) {
+    if (!pin || !getRaw()[pin]) return false;
+    const money = getSources().find(s => s.label === '成交额(元)');
+    const cnt = getSources().find(s => s.label === '成单');
+    if (!money || money.pageKey !== pin) return true;
+    if (!cnt || cnt.pageKey !== pin) return true;
+    const md = money.data || {}, cd = cnt.data || {};
+    for (const name of Object.keys(md)) {
+      if ((md[name] || 0) > 0 && !(cd[name] > 0)) return true;
+    }
+    return false;
+  }
   /** 打开顾问排行或一键取数后：没有钉住则采用最新本月表；钉住本月则期间显示本月，绝不跳到旧的 9 月 */
   function healRankingToCurrent() {
     const st = getSettings();
@@ -830,7 +843,12 @@
         if (added.length) upsertSources(added);
       }
     };
-    bindIfMismatch('成交额(元)', 'rankOrderKey', ['成交额(元)', '成单']);
+    // 成交额与成单必须同表整组重绑：只看成交额 pageKey 会对不上旧的成单来源
+    const orderPin = st.rankOrderKey;
+    if (orderPin && raw[orderPin] && orderSourcesNeedRebind(orderPin)) {
+      const added = bindExclusiveFromRaw(raw[orderPin], ['成交额(元)', '成单'], orderPin);
+      if (added.length) upsertSources(added);
+    }
     bindIfMismatch('变动金额(元)', 'rankChangeKey', ['变动金额(元)']);
     bindIfMismatch('总客资数量', 'rankLeadKey', ['总客资数量']);
     bindIfMismatch('无效客资', 'rankInvalidKey', ['无效客资']);
@@ -2050,15 +2068,18 @@
     const period0 = st.rankPeriod || '';
     const needFill = (label, kind) => {
       const pin = st[METRIC_PIN_KEY[label]];
-      if (pin && getRaw()[pin] && getSources().some(s => s.label === label && s.pageKey === pin)) {
-        if (sourceDataSum(label) > 0) return false;
+      if (pin && getRaw()[pin]) {
+        const hit = getSources().find(s => s.label === label && s.pageKey === pin);
+        if (hit && sourceDataSum(label) > 0) return false;
+        // 钉住了成交表，但成单/成交额缺了或还绑在别的表上 → 必须补
+        if (!hit) return true;
       }
       if (!getSources().some(s => s.label === label)) return true;
       if (sourceDataSum(label) > 0) return false;
       const t = pickRawForMetric(kind, period0);
       return !!(t && (t.rows || []).length);
     };
-    const needOrder = needFill('成交额(元)', 'order');
+    const needOrder = needFill('成交额(元)', 'order') || needFill('成单', 'order') || orderSourcesNeedRebind(st.rankOrderKey);
     const needChange = needFill('变动金额(元)', 'change');
     const dupLead = getSources().filter(s => s.label === '总客资数量').length > 1;
     const needLead = dupLead || needFill('总客资数量', 'lead');
@@ -2066,7 +2087,8 @@
     const needVisit = needFill('看位数', 'visit') || getSources().filter(s => s.label === '看位数').length > 1;
     if (needOrder || needChange || needLead || needInvalid || needVisit || dupLead) {
       const skip = [];
-      if (st.rankOrderKey && getRaw()[st.rankOrderKey] && sourceDataSum('成交额(元)') > 0) { skip.push('成交额(元)'); skip.push('成单'); }
+      const orderOk = st.rankOrderKey && getRaw()[st.rankOrderKey] && !orderSourcesNeedRebind(st.rankOrderKey);
+      if (orderOk) { skip.push('成交额(元)'); skip.push('成单'); }
       if (st.rankChangeKey && getRaw()[st.rankChangeKey] && sourceDataSum('变动金额(元)') > 0) skip.push('变动金额(元)');
       if (st.rankLeadKey && getRaw()[st.rankLeadKey] && sourceDataSum('总客资数量') > 0) skip.push('总客资数量');
       if (st.rankInvalidKey && getRaw()[st.rankInvalidKey] && sourceDataSum('无效客资') > 0) skip.push('无效客资');
