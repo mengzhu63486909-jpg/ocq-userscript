@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.6.9
+// @version      0.6.10
 // @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -24,7 +24,7 @@
 
   const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const SCRIPT_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.6.9';
+  const SCRIPT_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.6.10';
 
   // ---------------- 存储 ----------------
   const gmGet = (k, d) => {
@@ -41,7 +41,7 @@
   const setSteps = s => gmSet('ocq_steps', s);
   const getRoster = () => gmGet('ocq_roster', []);
   const setRoster = r => gmSet('ocq_roster', r);
-  const getSettings = () => Object.assign({ threshold: 80, redMode: 'progress', groupSubtotal: false, onlyRoster: false, title: '顾问业绩排行', tpl: '' }, gmGet('ocq_settings', {}));
+  const getSettings = () => Object.assign({ threshold: 80, redMode: 'progress', groupSubtotal: false, onlyRoster: false, title: '顾问业绩排行', tpl: '', rankExclude: ['张楚云', '林怀汇', '孙小雲', '苏裕豪'] }, gmGet('ocq_settings', {}));
   const setSettings = s => gmSet('ocq_settings', s);
   const getPrefs = () => gmGet('ocq_prefs', {});
   const setPrefs = p => gmSet('ocq_prefs', p);
@@ -1342,6 +1342,24 @@
   }
 
   // ---------------- 排行 ----------------
+  /** 默认顾问排行不显示这些人（精确姓名）；不删明细、不影响自定义报表 */
+  const DEFAULT_RANK_EXCLUDE = ['张楚云', '林怀汇', '孙小雲', '苏裕豪'];
+  function rankExcludeNames(settings) {
+    const extra = settings && Array.isArray(settings.rankExclude) ? settings.rankExclude : [];
+    const out = [], seen = new Set();
+    for (const n of DEFAULT_RANK_EXCLUDE.concat(extra)) {
+      const k = norm(n);
+      if (!k || seen.has(k)) continue;
+      seen.add(k);
+      out.push(n);
+    }
+    return out;
+  }
+  function isRankExcluded(name, settings) {
+    const k = norm(name);
+    if (!k) return false;
+    return rankExcludeNames(settings).some(x => norm(x) === k);
+  }
   function computeRanking(sources, roster, settings) {
     const agg = {}, extras = [];
     // 标准列若误存了多份来源，只取「条数最多 / 最新」的一份，避免 装修线索+判定有效线索 加出 622
@@ -1371,6 +1389,7 @@
     const has = f => !!agg[f];
     const rows = [];
     for (const [k, disp] of names) {
+      if (isRankExcluded(disp, settings) || isRankExcluded(k, settings)) continue;
       const ro = roster.find(r => norm(r.name) === k);
       const row = { 顾问: disp, 所属小组: (ro && ro.group) || '' };
       for (const f of STD) row[f] = g(f, k);
