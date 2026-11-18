@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         OCQ取数
 // @namespace    ocq-qushu
-// @version      0.6.10
-// @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。数据只存在本机。
+// @version      0.6.13
+// @description  OCQ 明细表一键取数：顾问排行+小组排名、自定义报表，导出 Excel/图片。主管可把本月顾问排行同步到过单助手，供组员查询本人预计收入。数据默认只存在本机。
 // @match        https://*.imocq.com/*
 // @updateURL    https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
 // @downloadURL  https://raw.githubusercontent.com/mengzhu63486909-jpg/ocq-userscript/main/OCQ%E5%8F%96%E6%95%B0.user.js
@@ -11,8 +11,13 @@
 // @grant        GM_setClipboard
 // @grant        GM_openInTab
 // @grant        GM_addValueChangeListener
+// @grant        GM_xmlhttpRequest
 // @grant        window.close
 // @grant        unsafeWindow
+// @connect      127.0.0.1
+// @connect      localhost
+// @connect      192.168.110.77
+// @connect      *
 // @require      https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js
 // @run-at       document-idle
 // ==/UserScript==
@@ -24,7 +29,7 @@
 
   const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const SCRIPT_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.6.10';
+  const SCRIPT_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.6.13';
 
   // ---------------- 存储 ----------------
   const gmGet = (k, d) => {
@@ -45,6 +50,14 @@
   const setSettings = s => gmSet('ocq_settings', s);
   const getPrefs = () => gmGet('ocq_prefs', {});
   const setPrefs = p => gmSet('ocq_prefs', p);
+  // 过单助手管理员连接：独立存储，不进 ocq_settings / 诊断 / 报表导出
+  const GDPAY_URL = 'ocq_gdpay_server_url';
+  const GDPAY_TOKEN = 'ocq_gdpay_admin_token';
+  const GDPAY_LAST = 'ocq_gdpay_last_sync';
+  const getGdPayUrl = () => String(gmGet(GDPAY_URL, '') || '').trim().replace(/\/+$/, '');
+  const getGdPayToken = () => String(gmGet(GDPAY_TOKEN, '') || '').trim();
+  const getGdPayLast = () => gmGet(GDPAY_LAST, null);
+  const setGdPayLast = v => gmSet(GDPAY_LAST, v);
 
   // ---------------- 标准字段 ----------------
   const STD = ['成交额(元)', '成单', '看位数', '总客资数量', '无效客资', '有效客资', '变动金额(元)'];
@@ -89,6 +102,34 @@
     if (r.width < 2 && r.height < 2) return false;
     const st = getComputedStyle(el);
     return st.display !== 'none' && st.visibility !== 'hidden' && st.opacity !== '0';
+  }
+  /** 取数插件自己的节点（含影子根、过单同步窗）。打开面板时绝不能改宿主页的框或滚动。 */
+  function isQushuNode(el) {
+    try {
+      while (el) {
+        if (el.id === 'ocq-qushu-host' || el.id === 'ocq-qushu-gdpay-dialog' || (el.classList && el.classList.contains('ocq-qushu-root'))) return true;
+        const root = el.getRootNode && el.getRootNode();
+        if (root && root !== document && root.host) { el = root.host; continue; }
+        el = el.parentElement || el.parentNode;
+        if (el === document || el === document.documentElement) break;
+      }
+    } catch (_) {}
+    return false;
+  }
+  function withHostPageFrozen(fn) {
+    const x = window.scrollX, y = window.scrollY;
+    let ae = null;
+    try { ae = document.activeElement; } catch (_) {}
+    const keep = ae && ae !== document.body && ae !== document.documentElement && !isQushuNode(ae);
+    try { return fn(); }
+    finally {
+      try {
+        const cur = document.activeElement;
+        if (cur && isQushuNode(cur) && typeof cur.blur === 'function') cur.blur();
+        if (keep && ae && ae.isConnected && typeof ae.focus === 'function') ae.focus({ preventScroll: true });
+      } catch (_) {}
+      try { if (window.scrollX !== x || window.scrollY !== y) window.scrollTo(x, y); } catch (_) {}
+    }
   }
   function isDisabled(el) {
     if (!el) return true;
@@ -160,6 +201,7 @@
       .concat([...document.querySelectorAll('table')].filter(t => !t.closest('.el-table, .ant-table, .vxe-table')));
     let best = null, score = -1;
     for (const t of cands) {
+      if (isQushuNode(t)) continue;
       if (/el-table__fixed/.test(t.className || '')) continue;
       if (!visible(t)) continue;
       const p = parseTable(t);
@@ -179,6 +221,7 @@
     const want = (Array.isArray(texts) ? texts : [texts]).map(String);
     const hits = [];
     for (const el of document.querySelectorAll('a, button, span, li, div, em, i, label')) {
+      if (isQushuNode(el)) continue;
       const t = (el.childElementCount === 0 ? el.textContent : el.innerText || '').replace(/\s+/g, ' ').trim();
       if (!want.includes(t) || !visible(el)) continue;
       if (clickableOnly && isDisabled(el)) continue;
@@ -191,12 +234,13 @@
   function parseTotal() {
     const chunks = [];
     for (const el of document.querySelectorAll('body *')) {
+      if (isQushuNode(el)) continue;
       if (el.children.length > 8) continue;
-      const t = (el.innerText || '').trim();
+      const t = (el.textContent || '').trim();
       if (t.length < 5 || t.length > 400 || !/记录数/.test(t)) continue;
       if (visible(el)) chunks.push(t);
     }
-    chunks.push((document.body.innerText || '').slice(0, 15000));
+    chunks.push((document.body.textContent || '').slice(0, 15000));
     for (const t of chunks) {
       let m = t.match(/记录数\s*[:：]\s*([0-9,]+)/);
       if (m) return parseInt(m[1].replace(/,/g, ''), 10);
@@ -208,11 +252,12 @@
   function footerText() {
     const bits = [];
     for (const el of document.querySelectorAll('body *')) {
+      if (isQushuNode(el)) continue;
       if (el.children.length > 6) continue;
-      const t = (el.innerText || '').trim();
+      const t = (el.textContent || '').trim();
       if (/记录数/.test(t) && t.length < 600 && visible(el)) bits.push(t);
     }
-    bits.push((document.body.innerText || '').slice(0, 15000));
+    bits.push((document.body.textContent || '').slice(0, 15000));
     return bits.join('\n');
   }
   function isLoading() {
@@ -242,7 +287,7 @@
     return false;
   }
   function findPageSizeSelect() {
-    const sels = [...document.querySelectorAll('select')].filter(visible);
+    const sels = [...document.querySelectorAll('select')].filter(el => !isQushuNode(el) && visible(el));
     for (const sel of sels) {
       let p = sel.parentElement;
       for (let i = 0; i < 5 && p; i++, p = p.parentElement) if (/每页显示|条\/页|每页/.test(p.innerText || '')) return sel;
@@ -917,6 +962,7 @@
     }
     renderTplSel(); renderSources(); renderRanking();
     const tip = period && parseRange(period) ? `（${rangeText(parseRange(period))}）` : '';
+    maybeUploadSalaryRanking('ranking').catch(() => {});
     return `已更新顾问排行${tip}` + (src.length ? '' : '');
   }
 
@@ -1932,6 +1978,7 @@
       </div>
       <div id="grabBar" style="display:none"><button class="btn grab" id="go">抓当前这张表</button><div class="muted"><label><input type="checkbox" id="addStep"> 加入每日取数步骤</label>　<span id="tblinfo"></span></div></div>
       <div class="prog" id="prog"></div>
+      <div class="muted" id="gdPayHint" style="font-size:12px;margin:4px 0 2px"></div>
       <div class="editor" id="newBox" style="display:none">
         <div class="wq">快速报表 <span class="muted">点一下就出</span><button class="mini" id="newClose" style="float:right">×</button></div>
         <div class="chips" id="presetBtns"></div>
@@ -1947,6 +1994,10 @@
       <div id="more" style="display:none">
         <div class="sec"><b>我的报表</b><div class="list" id="tplList"></div><a href="#" class="more" id="tplNew">＋ 新建报表</a></div>
         <details id="stepBox"><summary>取数步骤 <span class="muted" id="stepCnt"></span></summary><div class="list" id="steps"></div></details>
+        <details id="gdPayBox"><summary>同步到过单助手（工资）</summary>
+          <div class="muted">仅主管使用。取数成功后自动把<strong>当前有效月份</strong>的顾问排行上传到订单助手服务器，供组员用个人口令查询本人预计收入。服务器地址和管理口令请在独立设置窗里填写（不放在本面板的影子节点内，以免被 OCQ 页面按非输入框拦截键盘）。不会把管理口令写进脚本或诊断信息。Excel / 图片导出不受影响。</div>
+          <div><button class="btn p" type="button" id="gdPayOpen">配置服务器与管理口令</button> <button class="btn" type="button" id="gdPaySync">立即同步</button> <span class="muted" id="gdPayMsg"></span></div>
+        </details>
         <a href="#" class="more" id="advBtn">高级设置</a>
         <div id="adv" style="display:none">
         <details id="pickBox"><summary>这张表抓哪些列（一般不用改）</summary>
@@ -1978,6 +2029,12 @@
     </div>
   </div>`;
   document.documentElement.appendChild(host);
+  // 只在冒泡阶段拦住，不在捕获阶段拦截：否则点插件按钮时事件到不了按钮自己
+  ['mousedown', 'mouseup', 'click', 'pointerdown', 'pointerup', 'touchstart', 'touchend',
+    'focus', 'focusin', 'input', 'change', 'keydown', 'keyup', 'keypress', 'wheel'].forEach(type => {
+    root.addEventListener(type, ev => ev.stopPropagation());
+    host.addEventListener(type, ev => ev.stopPropagation());
+  });
   const $ = id => root.getElementById(id);
 
   let scan = null, busy = false, ed = null, scanRange = { hist: false, tag: '' };
@@ -2002,7 +2059,7 @@
   /** 这页筛的是哪段时间：先看页面上的日期框/网址，再看表里的日期列 */
   function pageRange(parsed) {
     let ds = [...String(location.href).matchAll(/(\d{4})-(\d{2})-(\d{2})/g)].map(m => m[0]);
-    document.querySelectorAll('input').forEach(i => { if (!visible(i)) return; for (const m of String(i.value || '').matchAll(/\d{4}\s*[-/.年]\s*\d{1,2}\s*[-/.月]\s*\d{1,2}/g)) { const d = parseDate(m[0]); if (d) ds.push(d); } });
+    document.querySelectorAll('input').forEach(i => { if (isQushuNode(i) || !visible(i)) return; for (const m of String(i.value || '').matchAll(/\d{4}\s*[-/.年]\s*\d{1,2}\s*[-/.月]\s*\d{1,2}/g)) { const d = parseDate(m[0]); if (d) ds.push(d); } });
     let src = 'filter';
     if (!ds.length && parsed) {
       src = 'data';
@@ -2181,6 +2238,7 @@
     $('rosterInfo').textContent = ro.length ? `名单 ${ro.length} 人：` + ro.slice(0, 8).map(r => `${r.name}/${r.group || '-'}/${r.target || '-'}`).join('；') + (ro.length > 8 ? '…' : '') : '名单为空';
     const tp = getTpls();
     $('tplList').innerHTML = tp.length ? tp.map((t, i) => `<div data-i="${i}"><span class="nm">${esc(t.name)}</span><button class="mini" data-a="edit">编辑</button><button class="mini" data-a="del">删除</button></div>`).join('') : '<span class="muted">（还没有自定义报表）</span>';
+    paintGdPayHint();
   }
   function renderAll() { renderTplSel(); renderSteps(); renderSources(); renderRanking(); renderSettings(); }
 
@@ -2852,17 +2910,29 @@
       $('replay').disabled = false;
       renderAll();
       if (!collapseProg(lines) && lines.length) $('prog').textContent = lines[lines.length - 1];
+      maybeUploadSalaryRanking('replay').catch(() => {});
     }
   }
 
-  function openPanel() { $('panel').classList.add('open'); doScan(); renderAll(); }
+  function openPanel() {
+    withHostPageFrozen(() => { $('panel').classList.add('open'); doScan(); renderAll(); });
+  }
+  function closePanel() {
+    withHostPageFrozen(() => { $('panel').classList.remove('open'); });
+  }
   $('verLabel').textContent = 'v' + SCRIPT_VER;
   $('fab').title = 'OCQ取数 v' + SCRIPT_VER;
-  $('fab').onclick = () => ($('panel').classList.contains('open') ? $('panel').classList.remove('open') : openPanel());
+  // mousedown preventDefault：避免按钮抢焦点，连带把宿主页滚到某个筛选框
+  $('fab').addEventListener('mousedown', ev => { ev.preventDefault(); ev.stopPropagation(); });
+  $('fab').onclick = ev => {
+    if (ev) ev.stopPropagation();
+    if ($('panel').classList.contains('open')) closePanel();
+    else openPanel();
+  };
   $('replay').onclick = startReplay;
-  $('close').onclick = () => $('panel').classList.remove('open');
+  $('close').onclick = () => closePanel();
   $('moreBtn').onclick = e => { e.preventDefault(); const m = $('more'); m.style.display = m.style.display === 'none' ? '' : 'none'; applyUI(); renderSettings(); renderSteps(); };
-  $('rescan').onclick = doScan;
+  $('rescan').onclick = () => { withHostPageFrozen(() => doScan()); };
   $('cols').addEventListener('change', savePrefs);
   $('cols').addEventListener('input', e => { if (e.target.classList.contains('custom')) savePrefs(); });
   $('namecol').onchange = savePrefs;
@@ -2891,6 +2961,266 @@
   const exportView = () => { let v = renderRanking(); if (v && isFbSel()) { try { v = fbSummaryView(); } catch (e) { alert(e.message); return null; } } return v; };
   $('xlsx').onclick = async () => { const v = exportView(); if (!v || !v.sheets[0].rows.length) return alert('还没有数据'); await exportExcel(v); };
   $('img').onclick = async () => { let v = exportView(); if (!v || !v.sheets[0].rows.length) return alert('还没有数据'); if (v.kind === 'fbsum') v = Object.assign({}, v, { sheets: [v.sheets[0]] }); $('prog').textContent = await copyImage(v); };
+  function gdPayHttp(method, path, body, token) {
+    const url = getGdPayUrl() + path;
+    const data = body == null ? null : JSON.stringify(body);
+    const headers = { 'X-OCQ-Admin-Token': token || getGdPayToken() };
+    if (data) headers['Content-Type'] = 'application/json';
+    return new Promise((resolve, reject) => {
+      const finish = (status, text) => {
+        let obj = null;
+        try { obj = JSON.parse(text || '{}'); } catch (e) { obj = null; }
+        resolve({ status, text: text || '', json: obj });
+      };
+      if (typeof GM_xmlhttpRequest === 'function') {
+        GM_xmlhttpRequest({
+          method, url, data: data || undefined, timeout: 30000, headers,
+          onload: r => finish(r.status, r.responseText),
+          onerror: () => reject(new Error('连不上订单助手服务器（' + getGdPayUrl() + '）。请确认 7789 服务已开、电脑在同一网络。')),
+          ontimeout: () => reject(new Error('连接订单助手服务器超时'))
+        });
+        return;
+      }
+      fetch(url, { method, headers, body: data || undefined })
+        .then(r => r.text().then(t => finish(r.status, t)))
+        .catch(() => reject(new Error('连不上订单助手服务器（' + getGdPayUrl() + '）')));
+    });
+  }
+  function paintGdPayHint() {
+    const el = $('gdPayHint');
+    const msg = $('gdPayMsg');
+    if (!el) return;
+    if (!getGdPayUrl() || !getGdPayToken()) {
+      const t = '排行未同步到过单助手：尚未配置管理员连接（在「更多 → 同步到过单助手」点「配置服务器与管理口令」并验证）。不影响 Excel / 图片导出。';
+      el.textContent = t;
+      if (msg && !msg.dataset.lock) msg.textContent = '尚未配置';
+      return;
+    }
+    const last = getGdPayLast();
+    if (!last) {
+      el.textContent = '已保存管理员连接，本月排行尚未同步。取数成功后会自动上传，也可点「立即同步」。';
+      if (msg && !msg.dataset.lock) msg.textContent = '尚未同步';
+      return;
+    }
+    if (last.ok) {
+      const when = last.at ? tm(last.at) : '';
+      const extra = last.incomplete ? '（有不完整记录，未按完整工资计算）' : '';
+      el.textContent = `排行已同步到过单助手：${last.month || ''} ${when}（UTC+8）${extra}`;
+      if (msg && !msg.dataset.lock) msg.textContent = `上次同步 ${when}`;
+    } else {
+      el.textContent = '排行未同步到过单助手：' + (last.error || '失败') + '。可在「更多」里重试。不影响 Excel / 图片导出。';
+      if (msg && !msg.dataset.lock) msg.textContent = '同步失败，可重试';
+    }
+  }
+  function rankingPresent(sources) {
+    const labels = new Set((sources || []).map(s => s.label));
+    const present = {};
+    present['成交额(元)'] = labels.has('成交额(元)');
+    present['变动金额(元)'] = labels.has('变动金额(元)');
+    present['总成交(元)'] = present['成交额(元)'];
+    present['成单'] = labels.has('成单');
+    present['看位数'] = labels.has('看位数');
+    present['总客资数量'] = labels.has('总客资数量');
+    present['无效客资'] = labels.has('无效客资');
+    present['有效客资'] = labels.has('有效客资') || (labels.has('总客资数量') && labels.has('无效客资'));
+    return present;
+  }
+  function buildSalaryRankingPayload() {
+    const st = getSettings();
+    const period = st.rankPeriod || '';
+    const per = parseRange(period);
+    const month = per && per.from === per.to ? per.from : (per ? '' : (typeof curYM === 'function' ? curYM() : ''));
+    if (per && per.from !== per.to) return { error: '来源月份混杂（' + per.from + ' ~ ' + per.to + '），已拒绝上传，以免把历史页算进本月工资' };
+    if (!month || !/^\d{4}-\d{2}$/.test(month)) return { error: '无法确定来源月份，已拒绝上传' };
+    if (per && per.from !== month) return { error: '来源月份与目标月份不一致，已拒绝上传' };
+    const sources = getSources();
+    const rk = computeRanking(sources, getRoster(), st);
+    const present = rankingPresent(sources);
+    const rows = (rk.rows || []).map(r => ({
+      name: r['顾问'],
+      '成交额(元)': r['成交额(元)'],
+      '变动金额(元)': r['变动金额(元)'],
+      '总成交(元)': r['总成交(元)'],
+      '成单': r['成单'],
+      '看位数': r['看位数'],
+      '总客资数量': r['总客资数量'],
+      '无效客资': r['无效客资'],
+      '有效客资': r['有效客资']
+    }));
+    const times = sources.map(x => x.time).concat(Object.values(getRaw()).map(t => t.time)).filter(Boolean);
+    const sourceKeys = {};
+    sources.forEach(x => { if (x.label && x.pageKey && !sourceKeys[x.label]) sourceKeys[x.label] = x.pageKey; });
+    return {
+      payload: {
+        month,
+        rankPeriod: period || month,
+        fetchedAt: times.length ? Math.max(...times) : Date.now(),
+        present,
+        sourceKeys,
+        rows
+      }
+    };
+  }
+  let gdPayBusy = false;
+  async function maybeUploadSalaryRanking(reason) {
+    paintGdPayHint();
+    if (!getGdPayUrl() || !getGdPayToken()) return { skipped: true };
+    if (gdPayBusy) return { skipped: true, busy: true };
+    const built = buildSalaryRankingPayload();
+    if (built.error) {
+      setGdPayLast({ ok: false, at: Date.now(), error: built.error, reason });
+      paintGdPayHint();
+      const p = $('prog');
+      if (p && reason === 'replay') p.textContent = (p.textContent ? p.textContent + '　' : '') + '未同步工资排行：' + built.error;
+      return { ok: false, error: built.error };
+    }
+    gdPayBusy = true;
+    try {
+      const r = await gdPayHttp('POST', '/api/guodan/admin/salary/ranking', built.payload);
+      if (r.status === 401 || r.status === 403) throw new Error('管理口令不正确或没有主管权限');
+      if (!r.json || r.json.ok === false) throw new Error((r.json && r.json.error) || ('HTTP ' + r.status));
+      setGdPayLast({ ok: true, at: Date.now(), month: r.json.month || built.payload.month, rowCount: r.json.rowCount, incomplete: !!r.json.incomplete, reason });
+      paintGdPayHint();
+      const p = $('prog');
+      if (p && reason === 'replay') p.textContent = (p.textContent ? p.textContent + '　' : '') + (r.json.incomplete ? '已同步排行（有不完整记录）' : '已同步排行到过单助手');
+      return { ok: true, json: r.json };
+    } catch (e) {
+      setGdPayLast({ ok: false, at: Date.now(), error: e.message, reason });
+      paintGdPayHint();
+      const p = $('prog');
+      if (p) p.textContent = (p.textContent ? p.textContent + '　' : '') + '排行未同步：' + e.message + '（可在「更多」里重试）';
+      return { ok: false, error: e.message };
+    } finally {
+      gdPayBusy = false;
+    }
+  }
+  // 影子节点里的 input 在 document 上会被 retarget 成宿主 DIV。
+  // OCQ 一类页面若在捕获阶段对「非 INPUT」按键 preventDefault，就会出现：能点按钮、焦点也在框上，但完全敲不进去，验证读到空值。
+  // 管理口令改在页面 light DOM 独立对话框填写（target 仍是 INPUT）。不要再改 Event.prototype，也不要把这两个框放回 shadow。
+  let gdPayDraft = { url: '', token: '' };
+  function gdPaySetMsg(text) {
+    const msg = $('gdPayMsg');
+    const dlgMsg = document.getElementById('ocq-qushu-gdpay-dmsg');
+    if (msg) msg.textContent = text || '';
+    if (dlgMsg) dlgMsg.textContent = text || '';
+  }
+  function gdPayDialogOpen() {
+    const box = document.getElementById('ocq-qushu-gdpay-dialog');
+    return !!(box && box.style.display !== 'none');
+  }
+  function closeGdPayDialog(keepDraft) {
+    const box = document.getElementById('ocq-qushu-gdpay-dialog');
+    if (!box) return;
+    const u = document.getElementById('ocq-qushu-gdpay-url');
+    const t = document.getElementById('ocq-qushu-gdpay-token');
+    if (keepDraft !== false) {
+      if (u) gdPayDraft.url = u.value;
+      if (t) gdPayDraft.token = t.value;
+    }
+    if (t) t.value = '';
+    box.style.display = 'none';
+    const openBtn = $('gdPayOpen');
+    if (openBtn) try { openBtn.focus(); } catch (_) {}
+  }
+  function ensureGdPayDialog() {
+    let box = document.getElementById('ocq-qushu-gdpay-dialog');
+    if (box) return box;
+    box = document.createElement('div');
+    box.id = 'ocq-qushu-gdpay-dialog';
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-modal', 'true');
+    box.setAttribute('aria-labelledby', 'ocq-qushu-gdpay-title');
+    box.style.cssText = 'all:initial;display:none;position:fixed;inset:0;z-index:2147483647;font-family:"Microsoft YaHei",sans-serif;';
+    const mask = document.createElement('div');
+    mask.id = 'ocq-qushu-gdpay-mask';
+    mask.style.cssText = 'position:absolute;inset:0;background:rgba(0,0,0,.35);';
+    const panel = document.createElement('div');
+    panel.id = 'ocq-qushu-gdpay-panel';
+    panel.style.cssText = 'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(440px,92vw);background:#fff;color:#222;border-radius:8px;box-shadow:0 8px 28px rgba(0,0,0,.28);padding:16px 18px;box-sizing:border-box;';
+    panel.innerHTML = '<div id="ocq-qushu-gdpay-title" style="font:600 16px/1.4 Microsoft YaHei,sans-serif;margin:0 0 8px">配置过单助手连接</div>'
+      + '<p style="margin:0 0 10px;font:12px/1.5 Microsoft YaHei,sans-serif;color:#666">只在本窗填写服务器地址和管理口令。管理口令不会写入取数诊断、报表导出或过单公开脚本。验证失败时草稿留在本窗，不会保存口令。</p>'
+      + '<label style="display:block;margin:8px 0 4px;font:13px Microsoft YaHei,sans-serif">服务器</label>'
+      + '<input id="ocq-qushu-gdpay-url" type="text" autocomplete="off" spellcheck="false" placeholder="http://192.168.110.77:7789" style="display:block;width:100%;box-sizing:border-box;padding:7px 8px;border:1px solid #ccc;border-radius:4px;font:13px/1.4 Consolas,monospace">'
+      + '<label style="display:block;margin:10px 0 4px;font:13px Microsoft YaHei,sans-serif">管理口令</label>'
+      + '<input id="ocq-qushu-gdpay-token" type="password" autocomplete="off" placeholder="订单助手后台管理口令，不是组员 Token" style="display:block;width:100%;box-sizing:border-box;padding:7px 8px;border:1px solid #ccc;border-radius:4px;font:13px/1.4 Consolas,monospace">'
+      + '<div style="margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+      + '<button type="button" id="ocq-qushu-gdpay-save" style="padding:7px 12px;border:1px solid #ff6a00;background:#ff6a00;color:#fff;border-radius:4px;cursor:pointer;font:13px Microsoft YaHei,sans-serif">验证并保存</button>'
+      + '<button type="button" id="ocq-qushu-gdpay-cancel" style="padding:7px 12px;border:1px solid #ccc;background:#fff;color:#333;border-radius:4px;cursor:pointer;font:13px Microsoft YaHei,sans-serif">关闭</button>'
+      + '<span id="ocq-qushu-gdpay-dmsg" style="font:12px/1.4 Microsoft YaHei,sans-serif;color:#666;flex:1"></span></div>';
+    box.appendChild(mask);
+    box.appendChild(panel);
+    document.documentElement.appendChild(box);
+    mask.addEventListener('click', () => closeGdPayDialog(true));
+    panel.addEventListener('click', ev => ev.stopPropagation());
+    // 不在输入框上 preventDefault，只阻止冒泡到 OCQ 快捷键；target 仍是 INPUT。
+    panel.addEventListener('keydown', ev => {
+      ev.stopPropagation();
+      if (ev.key === 'Escape') { ev.preventDefault(); closeGdPayDialog(true); }
+    });
+    panel.addEventListener('keypress', ev => ev.stopPropagation());
+    panel.addEventListener('keyup', ev => ev.stopPropagation());
+    document.getElementById('ocq-qushu-gdpay-cancel').addEventListener('click', () => closeGdPayDialog(true));
+    document.getElementById('ocq-qushu-gdpay-save').addEventListener('click', () => verifyAndSaveGdPay());
+    return box;
+  }
+  function openGdPayDialog() {
+    const box = ensureGdPayDialog();
+    const u = document.getElementById('ocq-qushu-gdpay-url');
+    const t = document.getElementById('ocq-qushu-gdpay-token');
+    u.value = gdPayDraft.url || getGdPayUrl() || '';
+    t.value = gdPayDraft.token || getGdPayToken() || '';
+    box.style.display = 'block';
+    gdPaySetMsg('');
+    setTimeout(() => { try { u.focus(); u.select(); } catch (_) {} }, 0);
+  }
+  function gdPayFormValues() {
+    const u = document.getElementById('ocq-qushu-gdpay-url');
+    const t = document.getElementById('ocq-qushu-gdpay-token');
+    return {
+      url: (u ? u.value : (gdPayDraft.url || '')).trim().replace(/\/+$/, ''),
+      token: (t ? t.value : (gdPayDraft.token || '')).trim()
+    };
+  }
+  async function verifyAndSaveGdPay() {
+    const v = gdPayFormValues();
+    const url = v.url, token = v.token;
+    gdPayDraft.url = url;
+    gdPayDraft.token = token;
+    const msg = $('gdPayMsg');
+    if (msg) msg.dataset.lock = '1';
+    const dlgMsg = document.getElementById('ocq-qushu-gdpay-dmsg');
+    if (dlgMsg) dlgMsg.textContent = '正在验证…';
+    if (msg && !dlgMsg) msg.textContent = '正在验证…';
+    if (!url || !/^https?:\/\/[^\s/]+/i.test(url)) {
+      gdPaySetMsg('请填写订单助手服务器地址，例如 http://192.168.110.77:7789');
+      if (msg) delete msg.dataset.lock;
+      return;
+    }
+    if (!token) {
+      gdPaySetMsg('请填写管理口令（订单助手后台的管理口令）');
+      if (msg) delete msg.dataset.lock;
+      return;
+    }
+    try {
+      gmSet(GDPAY_URL, url);
+      const r = await gdPayHttp('GET', '/api/guodan/admin/ping', null, token);
+      if (r.status === 401 || r.status === 403) throw new Error('管理口令不正确或没有主管权限');
+      if (!r.json || r.json.ok === false) throw new Error((r.json && r.json.error) || ('HTTP ' + r.status));
+      gmSet(GDPAY_TOKEN, token);
+      gdPayDraft.token = token;
+      gdPaySetMsg('已验证主管权限并保存。之后取数成功会自动同步，也可点「立即同步」。');
+      paintGdPayHint();
+    } catch (e) {
+      gdPaySetMsg('验证失败：' + e.message + '。可改地址或口令后重试。未保存管理口令。');
+      const tok = document.getElementById('ocq-qushu-gdpay-token');
+      if (tok) tok.value = token;
+      const urlEl = document.getElementById('ocq-qushu-gdpay-url');
+      if (urlEl) urlEl.value = url;
+    } finally {
+      if (msg) delete msg.dataset.lock;
+    }
+  }
+
   function diagInfo() {
     const cut = v => { v = String(v == null ? '' : v); return v.length > 24 ? v.slice(0, 24) + '…' : v; };
     const raw = Object.values(getRaw()), vt = rawTables(getRoster());
@@ -2931,6 +3261,11 @@
   };
   $('clrRoster').onclick = () => { if (confirm('清空顾问名单？')) { setRoster([]); renderSettings(); renderRanking(); } };
   $('saveSet').onclick = () => { const st = getSettings(); st.threshold = num($('th').value) || 80; st.redMode = $('rmF').checked ? 'fixed' : 'progress'; st.groupSubtotal = $('grpSub').checked; st.onlyRoster = $('only').checked; st.title = $('title').value.trim() || '顾问业绩排行'; setSettings(st); renderRanking(); $('smsg').textContent = '已保存'; };
+  if ($('gdPayOpen')) $('gdPayOpen').onclick = () => openGdPayDialog();
+  if ($('gdPaySync')) $('gdPaySync').onclick = () => maybeUploadSalaryRanking('manual').then(r => {
+    const msg = $('gdPayMsg');
+    if (msg) msg.textContent = r && r.skipped && !getGdPayToken() ? '请先验证并保存管理员连接' : (r && r.ok ? '已同步' : ('同步失败：' + ((r && r.error) || '未知错误')));
+  });
 
   // 工作模式（回放打开的后台标签页）
   const job = detectJob();
@@ -2938,7 +3273,7 @@
 
   window.__ocqUS = W.__ocqUS = {
     fbSummaryView, exportView, buildWorkbook,
-    openPanel, doScan, startGrab, startReplay, runReplay, getSources, getSteps, setSteps, computeRanking, getRoster, getSettings,
+    openPanel, closePanel, doScan, startGrab, startReplay, runReplay, isQushuNode, withHostPageFrozen, getSources, getSteps, setSteps, computeRanking, getRoster, getSettings,
     parsePaste, num, analyze, exportExcel, drawCanvas, summaryRows, infoLine, timeProgress, redCut, setSettingsForTest: setSettings, findBestTable, rewriteMonthDates, root, isBusy: () => busy, isReplaying: () => replaying, FIXED_COLS,
     getRaw, sourcesFromRaw, applyRawToRanking, syncRankingMetrics, pickRawForMetric, getTpls, saveTemplate, availablePresets, applyPreset, collapseProg, bestPersonIdx, fbPresets, applyFb, pageRange, parseDate, lastFullMonths, getUI: () => gmGet('ocq_ui', {}), buildPreset, openNewBox, openWizard, importTemplates, computeTemplate, compileFormula, rawTables, currentView, templateView, rankingView, groupRanking, openEditor, setRosterForTest: setRoster, renderAll
   };
